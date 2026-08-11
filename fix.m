@@ -12,6 +12,7 @@
 //    fails on a "country-ish" path.
 
 #import <Foundation/Foundation.h>
+#import <os/log.h>
 #import <objc/runtime.h>
 
 static os_log_t wa_log(void) {
