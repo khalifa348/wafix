@@ -1,4 +1,8 @@
-// waContainerFix v6 — v5 + universal unrecognized-selector auto-adder.
+// waContainerFix v8 — v7 + NULL-origOut crash fix.
+// v7 died in constructor: wa_swizzle(..., NULL) dereferenced origOut unconditionally
+//   -> SIGSEGV 0.39s after constructor (marker file proved: crash between
+//   'constructor' marker and 'swizzled resolveInstanceMethod:' marker).
+// v8: guard origOut before deref. v7's metaclass fix + re-entry guards retained.
 // v5 proved: country-DB fix WORKS (COUNTRY-MATCH logs firing, real TSV found, app
 //   reached FOREGROUND). Next wall: '-[WAAppPreferences setBackgroundAppRefreshStatus:]:
 //   unrecognized selector' 4s after launch — WAAppPreferences class lives in
@@ -365,7 +369,7 @@ static void wa_swizzle(Class cls, SEL sel, IMP imp, IMP *origOut) {
         os_log_fault(wa_log(), "SWIZZLE FAIL: %s +%s not found", class_getName(cls), sel_getName(sel));
         return;
     }
-    *origOut = method_getImplementation(m);
+    if (origOut) *origOut = method_getImplementation(m);
     method_setImplementation(m, imp);
     os_log_info(wa_log(), "swizzled +[%s %s]", class_getName(cls), sel_getName(sel));
 }
@@ -376,15 +380,15 @@ static void wa_swizzle_inst(Class cls, SEL sel, IMP imp, IMP *origOut) {
         os_log_fault(wa_log(), "SWIZZLE-INST FAIL: %s -%s not found", class_getName(cls), sel_getName(sel));
         return;
     }
-    *origOut = method_getImplementation(m);
+    if (origOut) *origOut = method_getImplementation(m);
     method_setImplementation(m, imp);
     os_log_info(wa_log(), "swizzled -[%s %s]", class_getName(cls), sel_getName(sel));
 }
 
 __attribute__((constructor))
 static void wa_init(void) {
-    os_log_info(wa_log(), "waContainerFix v7 constructor running");
-    wa_marker(@"=== waContainerFix v7 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v8 constructor running");
+    wa_marker(@"=== waContainerFix v8 constructor ===");
 
     // v6/v7: universal missing-selector synthesis (kills the whole crash family)
     wa_swizzle([NSObject class], @selector(resolveInstanceMethod:),
