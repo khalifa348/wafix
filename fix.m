@@ -1,19 +1,9 @@
-// waContainerFix v4 — nil-guard NSURL (v2) + country-DB synthesis with CORRECT
-// instance-method swizzling.
-// Evidence chain:
-//  ME28 .ips 214048: Thread 0 abort at WhatsApp+0x100150c = +[NSURL fileURLWithPath:] with nil
-//    (inside SharedModules super-init path) — v1 container swizzle was the wrong target.
-//  ME29 logs: v2 nil-guards FIRED -> super-init survives -> app runs +2s -> THEN:
-//    "-[__NSCFConstantString enumerateKeysAndObjectsUsingBlock:]: unrecognized selector"
-//    = country-DB global still holds a compile-time placeholder STRING.
-//  ME30 (v3, 2026-08-11 23:09): FULL exec proof — Bootstrap success, Foreground, scene
-//    registered, constructor ran, nil-guards fired, then SAME crash at 23:09:39.089.
-//    Root cause found in v3's own logs: "SWIZZLE FAIL: NSDictionary +initWithContentsOfFile:"
-//    — initWithContentsOfFile: is an INSTANCE method, but wa_swizzle only did
-//    class_getClassMethod. Same silent failure for
-//    -[NSFileManager containerURLForSecurityApplicationGroupIdentifier:].
-//    The loader's actual read (instance init) was never hooked -> nil -> placeholder.
-//  v4: wa_swizzle_inst() for instance methods; hook init variants + NSArray too.
+// waContainerFix v5 — v4 + loader-path discovery & NSString/NSData/error:-variant hooks.
+// v4 (ME31, 2026-08-11 23:32): ALL 9 swizzles OK, but ZERO MISS logs -> the loader
+//   never calls the hooked dict/array file readers. It must pre-check fileExistsAtPath:
+//   (path absent -> placeholder, read never attempted) or read via NSString/NSData or
+//   the modern error:-variant APIs. v5 hooks all of those + logs every fileExists path
+//   so we can plant the real countries.tsv via AFC at the exact path.
 
 #import <Foundation/Foundation.h>
 #import <os/log.h>
@@ -57,26 +47,38 @@ static id wa_containerURL(id self, SEL _cmd, NSString *group) {
 
 // ---------- v3: country-DB synthesis ----------
 static NSDictionary *g_fakeCountryDB = nil;
+static NSString *g_realTsv = nil;
 
-// Build a real NSDictionary out of countries.tsv. Format per line:
-//   ISO \t CC \t ITU \t LEN \t MNP \t FORMATS \t REPL \t AREA \t DIALLEN \t REGION
-// We keep keys = ISO codes (like the real DB) with a small value dict.
-static NSDictionary *wa_buildCountryDB(void) {
+static BOOL wa_isCountryPath(NSString *p) {
+    if (!p) return NO;
+    NSString *low = p.lowercaseString;
+    return [low containsString:@"countr"] || [low containsString:@"country"];
+}
+
+static NSString *wa_realTsv(void) {
+    if (g_realTsv) return g_realTsv;
     NSString *tsvPath = [[NSBundle mainBundle] pathForResource:@"countries"
                                                         ofType:@"tsv"
                                                    inDirectory:@"Frameworks/SharedModules.framework"];
     if (!tsvPath) {
-        // fall back to scanning the framework dir
         NSString *fw = [[[NSBundle mainBundle] bundlePath]
             stringByAppendingPathComponent:@"Frameworks/SharedModules.framework"];
         tsvPath = [fw stringByAppendingPathComponent:@"countries.tsv"];
     }
     NSError *err = nil;
-    NSString *txt = [NSString stringWithContentsOfFile:tsvPath encoding:NSUTF8StringEncoding error:&err];
-    if (!txt) {
-        os_log_fault(wa_log(), "countries.tsv unreadable: %{public}@", err.localizedDescription);
-        return nil;
-    }
+    g_realTsv = [NSString stringWithContentsOfFile:tsvPath encoding:NSUTF8StringEncoding error:&err];
+    if (!g_realTsv) os_log_fault(wa_log(), "countries.tsv unreadable: %{public}@", err.localizedDescription);
+    else os_log_info(wa_log(), "loaded real countries.tsv: %lu chars", (unsigned long)g_realTsv.length);
+    return g_realTsv;
+}
+
+// Build a real NSDictionary out of countries.tsv. Format per line:
+//   ISO \t CC \t ITU \t LEN \t MNP \t FORMATS \t REPL \t AREA \t DIALLEN \t REGION
+// We keep keys = ISO codes (like the real DB) with a small value dict.
+static NSDictionary *wa_buildCountryDB(void) {
+    if (g_fakeCountryDB) return g_fakeCountryDB;
+    NSString *txt = wa_realTsv();
+    if (!txt) return nil;
     NSMutableDictionary *out = [NSMutableDictionary dictionary];
     for (NSString *line in [txt componentsSeparatedByString:@"\n"]) {
         NSArray *f = [line componentsSeparatedByString:@"\t"];
@@ -89,21 +91,142 @@ static NSDictionary *wa_buildCountryDB(void) {
             @"iso": iso,
         };
     }
+    g_fakeCountryDB = out;
     os_log_info(wa_log(), "synthesized country DB: %lu entries", (unsigned long)out.count);
     return out;
+}
+
+// ---------- v5: fileExistsAtPath discovery ----------
+static IMP orig_fileExists = NULL;
+static IMP orig_fileExistsIsDir = NULL;
+static int g_existsLogCount = 0;
+
+static BOOL wa_fileExists(id self, SEL _cmd, NSString *path) {
+    if (path && g_existsLogCount < 60) {
+        g_existsLogCount++;
+        os_log_info(wa_log(), "fileExistsAtPath: %{public}@", path);
+    }
+    if (wa_isCountryPath(path)) {
+        os_log_info(wa_log(), "fileExistsAtPath COUNTRY-MATCH -> YES (synthesize)");
+        return YES;
+    }
+    return ((BOOL (*)(id, SEL, NSString *))orig_fileExists)(self, _cmd, path);
+}
+
+static BOOL wa_fileExistsIsDir(id self, SEL _cmd, NSString *path, BOOL *isDir) {
+    if (path && g_existsLogCount < 60) {
+        g_existsLogCount++;
+        os_log_info(wa_log(), "fileExistsAtPath:isDirectory: %{public}@", path);
+    }
+    if (wa_isCountryPath(path)) {
+        os_log_info(wa_log(), "fileExistsAtPath:isDirectory: COUNTRY-MATCH -> YES (synthesize)");
+        if (isDir) *isDir = NO;
+        return YES;
+    }
+    return ((BOOL (*)(id, SEL, NSString *, BOOL *))orig_fileExistsIsDir)(self, _cmd, path, isDir);
+}
+
+// ---------- v5: NSString file readers (TSV is text!) ----------
+static IMP orig_strFile = NULL;
+static NSString *wa_strFile(id self, SEL _cmd, NSString *path, NSStringEncoding enc, NSError **err) {
+    if (wa_isCountryPath(path)) {
+        os_log_info(wa_log(), "stringWithContentsOfFile COUNTRY-MATCH -> real TSV");
+        if (err) *err = nil;
+        return wa_realTsv();
+    }
+    return ((NSString *(*)(id, SEL, NSString *, NSStringEncoding, NSError **))orig_strFile)(self, _cmd, path, enc, err);
+}
+
+static IMP orig_strInitFile = NULL;
+static NSString *wa_strInitFile(id self, SEL _cmd, NSString *path, NSStringEncoding enc, NSError **err) {
+    if (wa_isCountryPath(path)) {
+        os_log_info(wa_log(), "initWithContentsOfFile COUNTRY-MATCH -> real TSV");
+        if (err) *err = nil;
+        return wa_realTsv();
+    }
+    return ((NSString *(*)(id, SEL, NSString *, NSStringEncoding, NSError **))orig_strInitFile)(self, _cmd, path, enc, err);
+}
+
+// ---------- v5: NSData readers ----------
+static IMP orig_dataFile = NULL;
+static NSData *wa_dataFile(id self, SEL _cmd, NSString *path) {
+    if (wa_isCountryPath(path)) {
+        os_log_info(wa_log(), "dataWithContentsOfFile COUNTRY-MATCH -> real TSV data");
+        return [wa_realTsv() dataUsingEncoding:NSUTF8StringEncoding];
+    }
+    return ((NSData *(*)(id, SEL, NSString *))orig_dataFile)(self, _cmd, path);
+}
+
+static IMP orig_dataURL = NULL;
+static NSData *wa_dataURL(id self, SEL _cmd, NSURL *url) {
+    if (wa_isCountryPath(url.path)) {
+        os_log_info(wa_log(), "dataWithContentsOfURL COUNTRY-MATCH -> real TSV data");
+        return [wa_realTsv() dataUsingEncoding:NSUTF8StringEncoding];
+    }
+    return ((NSData *(*)(id, SEL, NSURL *))orig_dataURL)(self, _cmd, url);
+}
+
+static IMP orig_dataInitFile = NULL;
+static NSData *wa_dataInitFile(id self, SEL _cmd, NSString *path) {
+    if (wa_isCountryPath(path)) {
+        os_log_info(wa_log(), "initWithContentsOfFile(NSData) COUNTRY-MATCH -> real TSV data");
+        return [wa_realTsv() dataUsingEncoding:NSUTF8StringEncoding];
+    }
+    return ((NSData *(*)(id, SEL, NSString *))orig_dataInitFile)(self, _cmd, path);
+}
+
+// ---------- v5: error:-variant dictionary/array readers ----------
+static IMP orig_dictURLErr = NULL;
+static NSDictionary *wa_dictURLErr(id self, SEL _cmd, NSURL *url, NSError **err) {
+    id r = ((id (*)(id, SEL, NSURL *, NSError **))orig_dictURLErr)(self, _cmd, url, err);
+    if (!r && wa_isCountryPath(url.path)) {
+        os_log_info(wa_log(), "dictionaryWithContentsOfURL:error: COUNTRY-MATCH -> synthesized DB");
+        if (err) *err = nil;
+        return wa_buildCountryDB();
+    }
+    return r;
+}
+
+static IMP orig_dictInitURLErr = NULL;
+static NSDictionary *wa_dictInitURLErr(id self, SEL _cmd, NSURL *url, NSError **err) {
+    id r = ((id (*)(id, SEL, NSURL *, NSError **))orig_dictInitURLErr)(self, _cmd, url, err);
+    if (!r && wa_isCountryPath(url.path)) {
+        os_log_info(wa_log(), "initWithContentsOfURL:error: COUNTRY-MATCH -> synthesized DB");
+        if (err) *err = nil;
+        return wa_buildCountryDB();
+    }
+    return r;
+}
+
+static IMP orig_arrURLErr = NULL;
+static NSArray *wa_arrURLErr(id self, SEL _cmd, NSURL *url, NSError **err) {
+    id r = ((id (*)(id, SEL, NSURL *, NSError **))orig_arrURLErr)(self, _cmd, url, err);
+    if (!r && wa_isCountryPath(url.path)) {
+        os_log_info(wa_log(), "arrayWithContentsOfURL:error: COUNTRY-MATCH -> DB keys");
+        if (err) *err = nil;
+        return wa_buildCountryDB().allKeys;
+    }
+    return r;
+}
+
+static IMP orig_arrInitURLErr = NULL;
+static NSArray *wa_arrInitURLErr(id self, SEL _cmd, NSURL *url, NSError **err) {
+    id r = ((id (*)(id, SEL, NSURL *, NSError **))orig_arrInitURLErr)(self, _cmd, url, err);
+    if (!r && wa_isCountryPath(url.path)) {
+        os_log_info(wa_log(), "initWithContentsOfURL:error:(NSArray) COUNTRY-MATCH -> DB keys");
+        if (err) *err = nil;
+        return wa_buildCountryDB().allKeys;
+    }
+    return r;
 }
 
 // +[NSDictionary dictionaryWithContentsOfFile:]
 static IMP orig_dictFile = NULL;
 static id wa_dictFile(id self, SEL _cmd, NSString *path) {
     id r = ((id (*)(id, SEL, NSString *))orig_dictFile)(self, _cmd, path);
-    if (!r && path) {
-        NSString *low = path.lowercaseString;
-        if ([low containsString:@"countr"] || [low containsString:@"country"]) {
-            os_log_info(wa_log(), "dictionaryWithContentsOfFile MISS for %{public}@ -> synthesizing", path);
-            if (!g_fakeCountryDB) g_fakeCountryDB = wa_buildCountryDB();
-            if (g_fakeCountryDB) return g_fakeCountryDB;
-        }
+    if (!r && wa_isCountryPath(path)) {
+        os_log_info(wa_log(), "dictionaryWithContentsOfFile MISS for %{public}@ -> synthesizing", path);
+        return wa_buildCountryDB();
     }
     return r;
 }
@@ -112,13 +235,9 @@ static id wa_dictFile(id self, SEL _cmd, NSString *path) {
 static IMP orig_dictURL = NULL;
 static id wa_dictURL(id self, SEL _cmd, NSURL *url) {
     id r = ((id (*)(id, SEL, NSURL *))orig_dictURL)(self, _cmd, url);
-    if (!r && url) {
-        NSString *low = url.path.lowercaseString;
-        if ([low containsString:@"countr"] || [low containsString:@"country"]) {
-            os_log_info(wa_log(), "dictionaryWithContentsOfURL MISS for %{public}@ -> synthesizing", url.path);
-            if (!g_fakeCountryDB) g_fakeCountryDB = wa_buildCountryDB();
-            if (g_fakeCountryDB) return g_fakeCountryDB;
-        }
+    if (!r && wa_isCountryPath(url.path)) {
+        os_log_info(wa_log(), "dictionaryWithContentsOfURL MISS for %{public}@ -> synthesizing", url.path);
+        return wa_buildCountryDB();
     }
     return r;
 }
@@ -127,13 +246,9 @@ static id wa_dictURL(id self, SEL _cmd, NSURL *url) {
 static IMP orig_dictInitFile = NULL;
 static id wa_dictInitFile(id self, SEL _cmd, NSString *path) {
     id r = ((id (*)(id, SEL, NSString *))orig_dictInitFile)(self, _cmd, path);
-    if (!r && path) {
-        NSString *low = path.lowercaseString;
-        if ([low containsString:@"countr"] || [low containsString:@"country"]) {
-            os_log_info(wa_log(), "initWithContentsOfFile MISS for %{public}@ -> synthesizing", path);
-            if (!g_fakeCountryDB) g_fakeCountryDB = wa_buildCountryDB();
-            if (g_fakeCountryDB) return g_fakeCountryDB;
-        }
+    if (!r && wa_isCountryPath(path)) {
+        os_log_info(wa_log(), "initWithContentsOfFile MISS for %{public}@ -> synthesizing", path);
+        return wa_buildCountryDB();
     }
     return r;
 }
@@ -142,13 +257,9 @@ static id wa_dictInitFile(id self, SEL _cmd, NSString *path) {
 static IMP orig_dictInitURL = NULL;
 static id wa_dictInitURL(id self, SEL _cmd, NSURL *url) {
     id r = ((id (*)(id, SEL, NSURL *))orig_dictInitURL)(self, _cmd, url);
-    if (!r && url) {
-        NSString *low = url.path.lowercaseString;
-        if ([low containsString:@"countr"] || [low containsString:@"country"]) {
-            os_log_info(wa_log(), "initWithContentsOfURL MISS for %{public}@ -> synthesizing", url.path);
-            if (!g_fakeCountryDB) g_fakeCountryDB = wa_buildCountryDB();
-            if (g_fakeCountryDB) return g_fakeCountryDB;
-        }
+    if (!r && wa_isCountryPath(url.path)) {
+        os_log_info(wa_log(), "initWithContentsOfURL MISS for %{public}@ -> synthesizing", url.path);
+        return wa_buildCountryDB();
     }
     return r;
 }
@@ -157,16 +268,9 @@ static id wa_dictInitURL(id self, SEL _cmd, NSURL *url) {
 static IMP orig_arrInitFile = NULL;
 static id wa_arrInitFile(id self, SEL _cmd, NSString *path) {
     id r = ((id (*)(id, SEL, NSString *))orig_arrInitFile)(self, _cmd, path);
-    if (!r && path) {
-        NSString *low = path.lowercaseString;
-        if ([low containsString:@"countr"] || [low containsString:@"country"]) {
-            os_log_info(wa_log(), "NSArray initWithContentsOfFile MISS for %{public}@ -> synthesizing", path);
-            if (!g_fakeCountryDB) g_fakeCountryDB = wa_buildCountryDB();
-            if (g_fakeCountryDB) {
-                // array variant: return the keys of the synthesized dict as an array
-                return g_fakeCountryDB.allKeys;
-            }
-        }
+    if (!r && wa_isCountryPath(path)) {
+        os_log_info(wa_log(), "NSArray initWithContentsOfFile MISS for %{public}@ -> synthesizing", path);
+        return wa_buildCountryDB().allKeys;
     }
     return r;
 }
@@ -175,15 +279,9 @@ static id wa_arrInitFile(id self, SEL _cmd, NSString *path) {
 static IMP orig_arrInitURL = NULL;
 static id wa_arrInitURL(id self, SEL _cmd, NSURL *url) {
     id r = ((id (*)(id, SEL, NSURL *))orig_arrInitURL)(self, _cmd, url);
-    if (!r && url) {
-        NSString *low = url.path.lowercaseString;
-        if ([low containsString:@"countr"] || [low containsString:@"country"]) {
-            os_log_info(wa_log(), "NSArray initWithContentsOfURL MISS for %{public}@ -> synthesizing", url.path);
-            if (!g_fakeCountryDB) g_fakeCountryDB = wa_buildCountryDB();
-            if (g_fakeCountryDB) {
-                return g_fakeCountryDB.allKeys;
-            }
-        }
+    if (!r && wa_isCountryPath(url.path)) {
+        os_log_info(wa_log(), "NSArray initWithContentsOfURL MISS for %{public}@ -> synthesizing", url.path);
+        return wa_buildCountryDB().allKeys;
     }
     return r;
 }
@@ -212,7 +310,7 @@ static void wa_swizzle_inst(Class cls, SEL sel, IMP imp, IMP *origOut) {
 
 __attribute__((constructor))
 static void wa_init(void) {
-    os_log_info(wa_log(), "waContainerFix v4 constructor running");
+    os_log_info(wa_log(), "waContainerFix v5 constructor running");
 
     // v2: NSURL nil guards
     wa_swizzle([NSURL class], @selector(fileURLWithPath:),
@@ -223,6 +321,36 @@ static void wa_init(void) {
     // v2: fake app-group container -> home (INSTANCE method — the v3 bug!)
     wa_swizzle_inst([NSFileManager class], @selector(containerURLForSecurityApplicationGroupIdentifier:),
                     (IMP)wa_containerURL, &orig_containerURL);
+
+    // v5: fileExistsAtPath discovery (logs the exact loader path)
+    wa_swizzle_inst([NSFileManager class], @selector(fileExistsAtPath:),
+                    (IMP)wa_fileExists, &orig_fileExists);
+    wa_swizzle_inst([NSFileManager class], @selector(fileExistsAtPath:isDirectory:),
+                    (IMP)wa_fileExistsIsDir, &orig_fileExistsIsDir);
+
+    // v5: NSString readers (countries.tsv is TEXT)
+    wa_swizzle([NSString class], @selector(stringWithContentsOfFile:encoding:error:),
+               (IMP)wa_strFile, &orig_strFile);
+    wa_swizzle_inst([NSString class], @selector(initWithContentsOfFile:encoding:error:),
+                    (IMP)wa_strInitFile, &orig_strInitFile);
+
+    // v5: NSData readers
+    wa_swizzle([NSData class], @selector(dataWithContentsOfFile:),
+               (IMP)wa_dataFile, &orig_dataFile);
+    wa_swizzle([NSData class], @selector(dataWithContentsOfURL:),
+               (IMP)wa_dataURL, &orig_dataURL);
+    wa_swizzle_inst([NSData class], @selector(initWithContentsOfFile:),
+                    (IMP)wa_dataInitFile, &orig_dataInitFile);
+
+    // v5: error:-variant dict/array readers (modern API)
+    wa_swizzle([NSDictionary class], @selector(dictionaryWithContentsOfURL:error:),
+               (IMP)wa_dictURLErr, &orig_dictURLErr);
+    wa_swizzle_inst([NSDictionary class], @selector(initWithContentsOfURL:error:),
+                    (IMP)wa_dictInitURLErr, &orig_dictInitURLErr);
+    wa_swizzle([NSArray class], @selector(arrayWithContentsOfURL:error:),
+               (IMP)wa_arrURLErr, &orig_arrURLErr);
+    wa_swizzle_inst([NSArray class], @selector(initWithContentsOfURL:error:),
+                    (IMP)wa_arrInitURLErr, &orig_arrInitURLErr);
 
     // v3/v4: country DB synthesis on read-failure — class + INSTANCE variants
     wa_swizzle([NSDictionary class], @selector(dictionaryWithContentsOfFile:),
@@ -239,3 +367,4 @@ static void wa_init(void) {
     wa_swizzle_inst([NSArray class], @selector(initWithContentsOfURL:),
                     (IMP)wa_arrInitURL, &orig_arrInitURL);
 }
+
