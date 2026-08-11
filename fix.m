@@ -1,15 +1,19 @@
-// waContainerFix v3 — nil-guard NSURL (v2) + synthesize the country DB
+// waContainerFix v4 — nil-guard NSURL (v2) + country-DB synthesis with CORRECT
+// instance-method swizzling.
 // Evidence chain:
 //  ME28 .ips 214048: Thread 0 abort at WhatsApp+0x100150c = +[NSURL fileURLWithPath:] with nil
 //    (inside SharedModules super-init path) — v1 container swizzle was the wrong target.
-//  ME29 logs: v2 nil-guards FIRED (22:16:29.079 "fileURLWithPath:nil GUARDED -> home" x2)
-//    -> super-init survives -> app runs +2s -> THEN:
+//  ME29 logs: v2 nil-guards FIRED -> super-init survives -> app runs +2s -> THEN:
 //    "-[__NSCFConstantString enumerateKeysAndObjectsUsingBlock:]: unrecognized selector"
-//    = country-DB global still holds a compile-time placeholder STRING because the real
-//    DB load (file read) never succeeded in the fake container.
-//  v3: keep the guards, ADD dictionaryWithContentsOfFile:/URL: hook that fabricates a
-//    real country dictionary from the bundle's countries.tsv when the original read
-//    fails on a "country-ish" path.
+//    = country-DB global still holds a compile-time placeholder STRING.
+//  ME30 (v3, 2026-08-11 23:09): FULL exec proof — Bootstrap success, Foreground, scene
+//    registered, constructor ran, nil-guards fired, then SAME crash at 23:09:39.089.
+//    Root cause found in v3's own logs: "SWIZZLE FAIL: NSDictionary +initWithContentsOfFile:"
+//    — initWithContentsOfFile: is an INSTANCE method, but wa_swizzle only did
+//    class_getClassMethod. Same silent failure for
+//    -[NSFileManager containerURLForSecurityApplicationGroupIdentifier:].
+//    The loader's actual read (instance init) was never hooked -> nil -> placeholder.
+//  v4: wa_swizzle_inst() for instance methods; hook init variants + NSArray too.
 
 #import <Foundation/Foundation.h>
 #import <os/log.h>
@@ -134,6 +138,56 @@ static id wa_dictInitFile(id self, SEL _cmd, NSString *path) {
     return r;
 }
 
+// -[NSDictionary initWithContentsOfURL:]
+static IMP orig_dictInitURL = NULL;
+static id wa_dictInitURL(id self, SEL _cmd, NSURL *url) {
+    id r = ((id (*)(id, SEL, NSURL *))orig_dictInitURL)(self, _cmd, url);
+    if (!r && url) {
+        NSString *low = url.path.lowercaseString;
+        if ([low containsString:@"countr"] || [low containsString:@"country"]) {
+            os_log_info(wa_log(), "initWithContentsOfURL MISS for %{public}@ -> synthesizing", url.path);
+            if (!g_fakeCountryDB) g_fakeCountryDB = wa_buildCountryDB();
+            if (g_fakeCountryDB) return g_fakeCountryDB;
+        }
+    }
+    return r;
+}
+
+// -[NSArray initWithContentsOfFile:] — country TSV may be read as an array
+static IMP orig_arrInitFile = NULL;
+static id wa_arrInitFile(id self, SEL _cmd, NSString *path) {
+    id r = ((id (*)(id, SEL, NSString *))orig_arrInitFile)(self, _cmd, path);
+    if (!r && path) {
+        NSString *low = path.lowercaseString;
+        if ([low containsString:@"countr"] || [low containsString:@"country"]) {
+            os_log_info(wa_log(), "NSArray initWithContentsOfFile MISS for %{public}@ -> synthesizing", path);
+            if (!g_fakeCountryDB) g_fakeCountryDB = wa_buildCountryDB();
+            if (g_fakeCountryDB) {
+                // array variant: return the keys of the synthesized dict as an array
+                return g_fakeCountryDB.allKeys;
+            }
+        }
+    }
+    return r;
+}
+
+// -[NSArray initWithContentsOfURL:]
+static IMP orig_arrInitURL = NULL;
+static id wa_arrInitURL(id self, SEL _cmd, NSURL *url) {
+    id r = ((id (*)(id, SEL, NSURL *))orig_arrInitURL)(self, _cmd, url);
+    if (!r && url) {
+        NSString *low = url.path.lowercaseString;
+        if ([low containsString:@"countr"] || [low containsString:@"country"]) {
+            os_log_info(wa_log(), "NSArray initWithContentsOfURL MISS for %{public}@ -> synthesizing", url.path);
+            if (!g_fakeCountryDB) g_fakeCountryDB = wa_buildCountryDB();
+            if (g_fakeCountryDB) {
+                return g_fakeCountryDB.allKeys;
+            }
+        }
+    }
+    return r;
+}
+
 static void wa_swizzle(Class cls, SEL sel, IMP imp, IMP *origOut) {
     Method m = class_getClassMethod(cls, sel);
     if (!m) {
@@ -145,9 +199,20 @@ static void wa_swizzle(Class cls, SEL sel, IMP imp, IMP *origOut) {
     os_log_info(wa_log(), "swizzled +[%s %s]", class_getName(cls), sel_getName(sel));
 }
 
+static void wa_swizzle_inst(Class cls, SEL sel, IMP imp, IMP *origOut) {
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) {
+        os_log_fault(wa_log(), "SWIZZLE-INST FAIL: %s -%s not found", class_getName(cls), sel_getName(sel));
+        return;
+    }
+    *origOut = method_getImplementation(m);
+    method_setImplementation(m, imp);
+    os_log_info(wa_log(), "swizzled -[%s %s]", class_getName(cls), sel_getName(sel));
+}
+
 __attribute__((constructor))
 static void wa_init(void) {
-    os_log_info(wa_log(), "waContainerFix v3 constructor running");
+    os_log_info(wa_log(), "waContainerFix v4 constructor running");
 
     // v2: NSURL nil guards
     wa_swizzle([NSURL class], @selector(fileURLWithPath:),
@@ -155,15 +220,22 @@ static void wa_init(void) {
     wa_swizzle([NSURL class], @selector(fileURLWithPath:isDirectory:),
                (IMP)wa_fileURLWithPathIsDir, &orig_fileURLWithPathIsDir);
 
-    // v2: fake app-group container -> home
-    wa_swizzle([NSFileManager class], @selector(containerURLForSecurityApplicationGroupIdentifier:),
-               (IMP)wa_containerURL, &orig_containerURL);
+    // v2: fake app-group container -> home (INSTANCE method — the v3 bug!)
+    wa_swizzle_inst([NSFileManager class], @selector(containerURLForSecurityApplicationGroupIdentifier:),
+                    (IMP)wa_containerURL, &orig_containerURL);
 
-    // v3: country DB synthesis on read-failure
+    // v3/v4: country DB synthesis on read-failure — class + INSTANCE variants
     wa_swizzle([NSDictionary class], @selector(dictionaryWithContentsOfFile:),
                (IMP)wa_dictFile, &orig_dictFile);
     wa_swizzle([NSDictionary class], @selector(dictionaryWithContentsOfURL:),
                (IMP)wa_dictURL, &orig_dictURL);
-    wa_swizzle([NSDictionary class], @selector(initWithContentsOfFile:),
-               (IMP)wa_dictInitFile, &orig_dictInitFile);
+    wa_swizzle_inst([NSDictionary class], @selector(initWithContentsOfFile:),
+                    (IMP)wa_dictInitFile, &orig_dictInitFile);
+    wa_swizzle_inst([NSDictionary class], @selector(initWithContentsOfURL:),
+                    (IMP)wa_dictInitURL, &orig_dictInitURL);
+    // NSArray reads (the TSV might be loaded as an array of lines)
+    wa_swizzle_inst([NSArray class], @selector(initWithContentsOfFile:),
+                    (IMP)wa_arrInitFile, &orig_arrInitFile);
+    wa_swizzle_inst([NSArray class], @selector(initWithContentsOfURL:),
+                    (IMP)wa_arrInitURL, &orig_arrInitURL);
 }
