@@ -1,4 +1,4 @@
-// waContainerFix v11 — v10 + lazy interpose init (reals valid pre-constructor)
+// waContainerFix v12 — v10 + lazy interpose init (reals valid pre-constructor)
 // + resolver rewritten: no class_getInstanceMethod/class_getMethodImplementation/
 // os_log inside resolver (all three re-enter resolveMethod_locked -> infinite
 // recursion -> stack overflow. ME40 crash 03:18:59: 6+ alternating frames).
@@ -66,14 +66,27 @@ static int g_realsInited = 0;
 
 static void wa_antiDetectInit(void) {
     if (g_realsInited) return;
-    // capture reals FIRST (RTLD_NEXT from an interposer returns the ORIGINAL
-    // definition dyld shadowed — documented dlsym behavior for interposers)
-    real_dyld_image_count = dlsym(RTLD_NEXT, "_dyld_image_count");
-    real_dyld_get_image_name = dlsym(RTLD_NEXT, "_dyld_get_image_name");
-    real_dyld_get_image_header = dlsym(RTLD_NEXT, "_dyld_get_image_header");
-    real_dyld_register_func_for_add_image = dlsym(RTLD_NEXT, "_dyld_register_func_for_add_image");
-    real_dyld_register_func_for_remove_image = dlsym(RTLD_NEXT, "_dyld_register_func_for_remove_image");
-    real_dladdr = dlsym(RTLD_NEXT, "dladdr");
+    // v12: capture reals via EXPLICIT libdyld handle (dlopen+dlsym(handle)).
+    // NEVER dlsym(RTLD_NEXT, ...) from an interposer: our dylib is the LAST
+    // image in load order (LIEF appended LC_LOAD_DYLIB), so RTLD_NEXT has
+    // nothing after us and dyld4 aborts the process (silent death, v11
+    // lesson: marker stopped after constructor, no crash report).
+    // dlsym on an explicit handle searches ONLY that image -> bypasses the
+    // interpose table -> returns the REAL functions.
+    void *libdyld = dlopen("/usr/lib/libdyld.dylib", RTLD_LAZY | RTLD_NOLOAD);
+    if (!libdyld) libdyld = dlopen("/usr/lib/libdyld.dylib", RTLD_LAZY);
+    wa_marker([NSString stringWithFormat:@"antiDetect: libdyld=%p", libdyld]);
+    if (libdyld) {
+        real_dyld_image_count = (uint32_t (*)(void))dlsym(libdyld, "_dyld_image_count");
+        real_dyld_get_image_name = (const char *(*)(uint32_t))dlsym(libdyld, "_dyld_get_image_name");
+        real_dyld_get_image_header = (const struct mach_header *(*)(uint32_t))dlsym(libdyld, "_dyld_get_image_header");
+        real_dyld_register_func_for_add_image = (void (*)(void (*)(const struct mach_header *, intptr_t)))dlsym(libdyld, "_dyld_register_func_for_add_image");
+        real_dyld_register_func_for_remove_image = (void (*)(void (*)(const struct mach_header *, intptr_t)))dlsym(libdyld, "_dyld_register_func_for_remove_image");
+        real_dladdr = (int (*)(const void *, Dl_info *))dlsym(libdyld, "dladdr");
+    }
+    wa_marker([NSString stringWithFormat:@"antiDetect: reals count=%p name=%p hdr=%p dladdr=%p",
+               real_dyld_image_count, real_dyld_get_image_name,
+               real_dyld_get_image_header, real_dladdr]);
     // our own header via dladdr on our code
     Dl_info info;
     if (real_dladdr && real_dladdr((const void *)&wa_antiDetectInit, &info)) {
@@ -570,8 +583,8 @@ static void wa_swizzle_inst(Class cls, SEL sel, IMP imp, IMP *origOut) {
 
 __attribute__((constructor))
 static void wa_init(void) {
-    os_log_info(wa_log(), "waContainerFix v11 constructor running");
-    wa_marker(@"=== waContainerFix v11 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v12 constructor running");
+    wa_marker(@"=== waContainerFix v12 constructor ===");
 
     // v10/v11: anti-tamper evasion — init dyld interpose reals FIRST so the
     // fakes are correct before any swizzle/launch activity
