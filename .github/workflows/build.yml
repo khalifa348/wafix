@@ -1,0 +1,19 @@
+name: build-dylib
+on: [push]
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build arm64 iOS dylib
+        run: |
+          xcrun -sdk iphoneos clang -arch arm64 -dynamiclib \
+            -miphoneos-version-min=15.0 -fobjc-arc \
+            -framework Foundation fix.m -o libwaContainerFix.dylib
+          lipo -info libwaContainerFix.dylib
+          file libwaContainerFix.dylib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wafix-dylib
+          path: libwaContainerFix.dylib
+          if-no-files-found: error
