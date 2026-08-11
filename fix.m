@@ -1,4 +1,24 @@
-// waContainerFix v9 — v8 + os_log-encode blacklist + de-duped markers.
+// waContainerFix v10 — v9 + dyld-interpose anti-detection.
+// v9 (ME39) proven: os_log flood GONE (3 unique resolves vs 1518), resolver
+//   healthy, markers de-duped. BUT app STILL self-exits ~2min after launch,
+//   silently, no crash report, no jetsam, no watchdog — and it RELAUNCHED
+//   itself (4 constructor blocks in marker = SpringBoard relaunch after each
+//   silent exit).
+// ROOT CAUSE (static analysis of pristine binary): WhatsApp anti-tamper.
+//   Strings found: WASDEKmpSyncdIncomingAntiTamperingValidator,
+//   WASDEKmpSyncdAntiTamperingLoggingHelper(+Companion), WASDEAntiTamperingData,
+//   __dyld_image_count, __dyld_get_image_name, __dyld_get_image_header,
+//   _dyld_register_func_for_add_image (dyld load callbacks!), dladdr, sysctl,
+//   isJailbrokenDevice + "It appears that your device is jailbroken" UI text.
+//   The app registers a dyld add-image callback, enumerates loaded images,
+//   spots libwaContainerFix.dylib, and calls exit() silently.
+// v10: hide our dylib from dyld enumeration via DYLD_INTERPOSE:
+//   - _dyld_image_count        -> real count - 1
+//   - _dyld_get_image_name     -> index shifted past our image
+//   - _dyld_get_image_header   -> same shift
+//   - _dyld_register_func_for_add_image / _remove -> swallow callbacks
+//   - dladdr                   -> fail for addresses inside our dylib
+//   Keeps v9 resolver + blacklist + de-duped markers.
 // v7 died in constructor: wa_swizzle(..., NULL) dereferenced origOut unconditionally
 //   -> SIGSEGV 0.39s after constructor (marker file proved: crash between
 //   'constructor' marker and 'swizzled resolveInstanceMethod:' marker).
@@ -15,6 +35,89 @@
 #import <Foundation/Foundation.h>
 #import <os/log.h>
 #import <objc/runtime.h>
+#import <mach-o/dyld.h>
+#import <dlfcn.h>
+
+// ---------- v10: dyld interpose (anti-tamper evasion) ----------
+// Real function pointers captured from libdyld (RTLD_NEXT skips our image).
+static uint32_t (*real_dyld_image_count)(void);
+static const char *(*real_dyld_get_image_name)(uint32_t index);
+static const struct mach_header *(*real_dyld_get_image_header)(uint32_t index);
+static void (*real_dyld_register_func_for_add_image)(void (*)(const struct mach_header *mh, intptr_t vmaddr_slide));
+static void (*real_dyld_register_func_for_remove_image)(void (*)(const struct mach_header *mh, intptr_t vmaddr_slide));
+static int (*real_dladdr)(const void *, Dl_info *);
+
+static const struct mach_header *g_ourHeader = NULL;
+static uint32_t g_ourIndex = UINT32_MAX;
+
+static void wa_antiDetectInit(void) {
+    // capture reals FIRST (RTLD_NEXT = image after ours = libdyld)
+    real_dyld_image_count = dlsym(RTLD_NEXT, "_dyld_image_count");
+    real_dyld_get_image_name = dlsym(RTLD_NEXT, "_dyld_get_image_name");
+    real_dyld_get_image_header = dlsym(RTLD_NEXT, "_dyld_get_image_header");
+    real_dyld_register_func_for_add_image = dlsym(RTLD_NEXT, "_dyld_register_func_for_add_image");
+    real_dyld_register_func_for_remove_image = dlsym(RTLD_NEXT, "_dyld_register_func_for_remove_image");
+    real_dladdr = dlsym(RTLD_NEXT, "dladdr");
+    // our own header via dladdr on our code
+    Dl_info info;
+    if (real_dladdr && real_dladdr((const void *)&wa_antiDetectInit, &info)) {
+        g_ourHeader = info.dli_fbase;
+    }
+    // our index in the real dyld list
+    if (g_ourHeader && real_dyld_image_count && real_dyld_get_image_header) {
+        uint32_t n = real_dyld_image_count();
+        for (uint32_t i = 0; i < n; i++) {
+            if (real_dyld_get_image_header(i) == g_ourHeader) { g_ourIndex = i; break; }
+        }
+    }
+    wa_marker([NSString stringWithFormat:@"antiDetect: ourHeader=%p ourIndex=%u count=%u",
+               g_ourHeader, g_ourIndex, real_dyld_image_count ? real_dyld_image_count() : 0]);
+}
+
+static uint32_t wa_fake_dyld_image_count(void) {
+    uint32_t n = real_dyld_image_count ? real_dyld_image_count() : 0;
+    return (g_ourIndex < n) ? n - 1 : n;
+}
+
+static const char *wa_fake_dyld_get_image_name(uint32_t index) {
+    if (g_ourIndex != UINT32_MAX && index >= g_ourIndex) index++;
+    return real_dyld_get_image_name ? real_dyld_get_image_name(index) : "";
+}
+
+static const struct mach_header *wa_fake_dyld_get_image_header(uint32_t index) {
+    if (g_ourIndex != UINT32_MAX && index >= g_ourIndex) index++;
+    return real_dyld_get_image_header ? real_dyld_get_image_header(index) : NULL;
+}
+
+// swallow add/remove image callbacks — the anti-tamper never learns of our dylib
+static void wa_fake_dyld_register_func_for_add_image(void (*func)(const struct mach_header *, intptr_t)) {
+    (void)func;  // deliberately drop
+}
+
+static void wa_fake_dyld_register_func_for_remove_image(void (*func)(const struct mach_header *, intptr_t)) {
+    (void)func;  // deliberately drop
+}
+
+// dladdr: return 0 (not found) when the address belongs to our dylib
+static int wa_fake_dladdr(const void *addr, Dl_info *info) {
+    if (!real_dladdr) return 0;
+    if (real_dladdr(addr, info) == 0) return 0;
+    if (info && info->dli_fbase == g_ourHeader) return 0;
+    return 1;
+}
+
+// DYLD_INTERPOSE section (__DATA,__interpose) — same shape as the SDK macro
+#define WA_INTERPOSE(replacement, replacee) \
+    __attribute__((used)) static struct { const void *replacement; const void *replacee; } \
+    _wa_interpose_##replacee __attribute__((section("__DATA,__interpose"))) = { \
+        (const void *)(unsigned long)&replacement, (const void *)(unsigned long)&replacee };
+
+WA_INTERPOSE(wa_fake_dyld_image_count, _dyld_image_count)
+WA_INTERPOSE(wa_fake_dyld_get_image_name, _dyld_get_image_name)
+WA_INTERPOSE(wa_fake_dyld_get_image_header, _dyld_get_image_header)
+WA_INTERPOSE(wa_fake_dyld_register_func_for_add_image, _dyld_register_func_for_add_image)
+WA_INTERPOSE(wa_fake_dyld_register_func_for_remove_image, _dyld_register_func_for_remove_image)
+WA_INTERPOSE(wa_fake_dladdr, dladdr)
 
 static os_log_t wa_log(void) {
     static os_log_t l;
