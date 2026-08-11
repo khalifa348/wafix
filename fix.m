@@ -1,4 +1,9 @@
-// waContainerFix v10 — v9 + dyld-interpose anti-detection.
+// waContainerFix v11 — v10 + lazy interpose init (reals valid pre-constructor)
+// + resolver rewritten: no class_getInstanceMethod/class_getMethodImplementation/
+// os_log inside resolver (all three re-enter resolveMethod_locked -> infinite
+// recursion -> stack overflow. ME40 crash 03:18:59: 6+ alternating frames).
+// v11 = v10 dyld-interpose anti-detection + thread-local recursion guards +
+// direct method-list scans + marker-only resolver logging.
 // v9 (ME39) proven: os_log flood GONE (3 unique resolves vs 1518), resolver
 //   healthy, markers de-duped. BUT app STILL self-exits ~2min after launch,
 //   silently, no crash report, no jetsam, no watchdog — and it RELAUNCHED
@@ -42,7 +47,12 @@
 static void wa_marker(NSString *line);
 
 // ---------- v10: dyld interpose (anti-tamper evasion) ----------
-// Real function pointers captured from libdyld (RTLD_NEXT skips our image).
+// Real function pointers captured from libdyld. MUST be captured lazily on
+// first use (NOT only in the constructor): dyld applies the __interpose
+// section the moment our image loads — BEFORE the constructor runs — so
+// WhatsApp's +load methods can hit our fakes with uninitialized reals
+// (v11 lesson: v10's constructor-only init left reals NULL -> dladdr failed
+// for the whole process -> system frameworks broke -> resolver recursion).
 static uint32_t (*real_dyld_image_count)(void);
 static const char *(*real_dyld_get_image_name)(uint32_t index);
 static const struct mach_header *(*real_dyld_get_image_header)(uint32_t index);
@@ -52,9 +62,12 @@ static int (*real_dladdr)(const void *, Dl_info *);
 
 static const struct mach_header *g_ourHeader = NULL;
 static uint32_t g_ourIndex = UINT32_MAX;
+static int g_realsInited = 0;
 
 static void wa_antiDetectInit(void) {
-    // capture reals FIRST (RTLD_NEXT = image after ours = libdyld)
+    if (g_realsInited) return;
+    // capture reals FIRST (RTLD_NEXT from an interposer returns the ORIGINAL
+    // definition dyld shadowed — documented dlsym behavior for interposers)
     real_dyld_image_count = dlsym(RTLD_NEXT, "_dyld_image_count");
     real_dyld_get_image_name = dlsym(RTLD_NEXT, "_dyld_get_image_name");
     real_dyld_get_image_header = dlsym(RTLD_NEXT, "_dyld_get_image_header");
@@ -73,21 +86,25 @@ static void wa_antiDetectInit(void) {
             if (real_dyld_get_image_header(i) == g_ourHeader) { g_ourIndex = i; break; }
         }
     }
+    g_realsInited = 1;
     wa_marker([NSString stringWithFormat:@"antiDetect: ourHeader=%p ourIndex=%u count=%u",
                g_ourHeader, g_ourIndex, real_dyld_image_count ? real_dyld_image_count() : 0]);
 }
 
 static uint32_t wa_fake_dyld_image_count(void) {
+    wa_antiDetectInit();
     uint32_t n = real_dyld_image_count ? real_dyld_image_count() : 0;
     return (g_ourIndex < n) ? n - 1 : n;
 }
 
 static const char *wa_fake_dyld_get_image_name(uint32_t index) {
+    wa_antiDetectInit();
     if (g_ourIndex != UINT32_MAX && index >= g_ourIndex) index++;
     return real_dyld_get_image_name ? real_dyld_get_image_name(index) : "";
 }
 
 static const struct mach_header *wa_fake_dyld_get_image_header(uint32_t index) {
+    wa_antiDetectInit();
     if (g_ourIndex != UINT32_MAX && index >= g_ourIndex) index++;
     return real_dyld_get_image_header ? real_dyld_get_image_header(index) : NULL;
 }
@@ -103,6 +120,7 @@ static void wa_fake_dyld_register_func_for_remove_image(void (*func)(const struc
 
 // dladdr: return 0 (not found) when the address belongs to our dylib
 static int wa_fake_dladdr(const void *addr, Dl_info *info) {
+    wa_antiDetectInit();
     if (!real_dladdr) return 0;
     if (real_dladdr(addr, info) == 0) return 0;
     if (info && info->dli_fbase == g_ourHeader) return 0;
@@ -184,52 +202,82 @@ static BOOL wa_isOsLogSelector(const char *sel) {
 
 static id wa_noop(id self, SEL _cmd) { return nil; }
 
-// return YES if the class does REAL forwarding (NSProxy-like) — don't hijack it
-static BOOL wa_hasRealForwarding(Class cls) {
-    IMP mine = class_getMethodImplementation([NSObject class], @selector(forwardInvocation:));
-    IMP theirs = class_getMethodImplementation(cls, @selector(forwardInvocation:));
-    return theirs != mine;
+// v11: NEVER call class_getInstanceMethod / class_getMethodImplementation
+// inside the resolver — those trigger resolveMethod_locked -> our swizzle ->
+// infinite recursion (ME40 crash 03:18:59: 6+ alternating frames, stack
+// overflow -> KERN_PROTECTION_FAILURE in localtime_r/os_log). Use
+// class_copyMethodList (direct read, no resolution) + class_addMethod only.
+static _Thread_local BOOL wa_resolvingInst = NO;
+static _Thread_local BOOL wa_resolvingCls = NO;
+
+// does the class DIRECTLY define forwardInvocation:? (no resolution trigger)
+static BOOL wa_hasRealForwardingDirect(Class cls) {
+    unsigned int count = 0;
+    Method *methods = class_copyMethodList(cls, &count);
+    if (!methods) return NO;
+    SEL fwd = sel_registerName("forwardInvocation:");
+    BOOL found = NO;
+    for (unsigned int i = 0; i < count; i++) {
+        if (method_getName(methods[i]) == fwd) { found = YES; break; }
+    }
+    free(methods);
+    return found;
+}
+
+// does the class DIRECTLY define this selector? (no resolution trigger)
+static BOOL wa_hasMethodDirect(Class cls, SEL sel) {
+    unsigned int count = 0;
+    Method *methods = class_copyMethodList(cls, &count);
+    if (!methods) return NO;
+    BOOL found = NO;
+    for (unsigned int i = 0; i < count; i++) {
+        if (method_getName(methods[i]) == sel) { found = YES; break; }
+    }
+    free(methods);
+    return found;
 }
 
 static BOOL wa_resolveInstance(id self, SEL _cmd, SEL name) {
+    if (wa_resolvingInst) return NO;   // recursion guard (thread-local)
     Class cls = (Class)self;
     const char *clsName = class_getName(cls);
     const char *selName = sel_getName(name);
     // v9: os_log private path — stock behavior, instant NO, no log/marker churn
     if (wa_isOsLogSelector(selName)) return NO;
-    os_log_info(wa_log(), "RESOLVE-INST %s -%s -> no-op", clsName, selName);
+    // v11: NO os_log here — os_log's encoding path can itself trigger
+    // class_respondsToSelector -> resolveMethod_locked -> re-entry (ME40
+    // crash stack showed exactly that). Marker file is our ground truth.
     wa_markerOnce([NSString stringWithFormat:@"RESOLVE-INST %s -%s", clsName, selName]);
-    if (wa_hasRealForwarding(cls)) {
-        os_log_info(wa_log(), "RESOLVE-INST %s -%s -> forwarding class, hands off", clsName, selName);
+    if (wa_hasRealForwardingDirect(cls)) {
         return NO;
     }
-    if (class_getInstanceMethod(cls, name)) return YES;   // already added (re-entry guard)
-    if (!class_addMethod(cls, name, (IMP)wa_noop, "@@:")) {
-        os_log_fault(wa_log(), "RESOLVE-INST ADD FAIL %s -%s", clsName, selName);
+    wa_resolvingInst = YES;
+    BOOL added = class_addMethod(cls, name, (IMP)wa_noop, "@@:");
+    wa_resolvingInst = NO;
+    if (!added && !wa_hasMethodDirect(cls, name)) {
         return NO;
     }
-    os_log_info(wa_log(), "RESOLVE-INST %s -%s -> no-op ADDED", clsName, selName);
     return YES;
 }
 
 static BOOL wa_resolveClass(id self, SEL _cmd, SEL name) {
+    if (wa_resolvingCls) return NO;    // recursion guard (thread-local)
     Class meta = object_getClass(self);
     const char *clsName = class_getName(meta);
     const char *selName = sel_getName(name);
     // v9: os_log private path — stock behavior, instant NO
     if (wa_isOsLogSelector(selName)) return NO;
-    os_log_info(wa_log(), "RESOLVE-CLASS %s +%s -> no-op", clsName, selName);
+    // v11: NO os_log here (re-entry vector, see wa_resolveInstance)
     wa_markerOnce([NSString stringWithFormat:@"RESOLVE-CLASS %s +%s", clsName, selName]);
-    if (wa_hasRealForwarding(meta)) {
-        os_log_info(wa_log(), "RESOLVE-CLASS %s +%s -> forwarding class, hands off", clsName, selName);
+    if (wa_hasRealForwardingDirect(meta)) {
         return NO;
     }
-    if (class_getClassMethod(meta, name)) return YES;      // already added (re-entry guard)
-    if (!class_addMethod(meta, name, (IMP)wa_noop, "@@:")) {
-        os_log_fault(wa_log(), "RESOLVE-CLASS ADD FAIL %s +%s", clsName, selName);
+    wa_resolvingCls = YES;
+    BOOL added = class_addMethod(meta, name, (IMP)wa_noop, "@@:");
+    wa_resolvingCls = NO;
+    if (!added && !wa_hasMethodDirect(meta, name)) {
         return NO;
     }
-    os_log_info(wa_log(), "RESOLVE-CLASS %s +%s -> no-op ADDED", clsName, selName);
     return YES;
 }
 
@@ -522,8 +570,13 @@ static void wa_swizzle_inst(Class cls, SEL sel, IMP imp, IMP *origOut) {
 
 __attribute__((constructor))
 static void wa_init(void) {
-    os_log_info(wa_log(), "waContainerFix v9 constructor running");
-    wa_marker(@"=== waContainerFix v9 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v11 constructor running");
+    wa_marker(@"=== waContainerFix v11 constructor ===");
+
+    // v10/v11: anti-tamper evasion — init dyld interpose reals FIRST so the
+    // fakes are correct before any swizzle/launch activity
+    wa_antiDetectInit();
+    wa_marker(@"antiDetect init done");
 
     // v6/v7: universal missing-selector synthesis (kills the whole crash family)
     wa_swizzle([NSObject class], @selector(resolveInstanceMethod:),
