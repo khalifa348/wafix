@@ -1,9 +1,12 @@
-// waContainerFix v5 — v4 + loader-path discovery & NSString/NSData/error:-variant hooks.
-// v4 (ME31, 2026-08-11 23:32): ALL 9 swizzles OK, but ZERO MISS logs -> the loader
-//   never calls the hooked dict/array file readers. It must pre-check fileExistsAtPath:
-//   (path absent -> placeholder, read never attempted) or read via NSString/NSData or
-//   the modern error:-variant APIs. v5 hooks all of those + logs every fileExists path
-//   so we can plant the real countries.tsv via AFC at the exact path.
+// waContainerFix v6 — v5 + universal unrecognized-selector auto-adder.
+// v5 proved: country-DB fix WORKS (COUNTRY-MATCH logs firing, real TSV found, app
+//   reached FOREGROUND). Next wall: '-[WAAppPreferences setBackgroundAppRefreshStatus:]:
+//   unrecognized selector' 4s after launch — WAAppPreferences class lives in
+//   SharedModules (FairPlay), selector only in main binary -> category method not
+//   attaching (same family as ME28/ME34 country-DB placeholder crash).
+// v6: swizzle +[NSObject resolveInstanceMethod:] / resolveClassMethod: to
+//   synthesize no-op methods for ANY missing selector. Kills the whole family at
+//   once instead of whack-a-mole. Logs every synthesis.
 
 #import <Foundation/Foundation.h>
 #import <os/log.h>
@@ -16,6 +19,27 @@ static os_log_t wa_log(void) {
         l = os_log_create("com.wafix", "dylib");
     });
     return l;
+}
+
+// ---------- v6: universal missing-selector synthesis ----------
+// Called whenever a class fails to find an instance method. We add a no-op
+// implementation so the app keeps running instead of NSInvalidArgumentException.
+static void wa_noop(void) {}
+
+static BOOL wa_resolveInstance(id self, SEL _cmd, SEL name) {
+    // _cmd is resolveInstanceMethod:; name is the missing selector.
+    const char *cls = class_getName(object_getClass(self));
+    os_log_info(wa_log(), "RESOLVE-INST %s -%s -> no-op", cls, sel_getName(name));
+    class_addMethod(object_getClass(self), name, (IMP)wa_noop, "v@:");
+    return YES;
+}
+
+static BOOL wa_resolveClass(id self, SEL _cmd, SEL name) {
+    const char *cls = class_getName(self);
+    os_log_info(wa_log(), "RESOLVE-CLASS %s +%s -> no-op", cls, sel_getName(name));
+    Class meta = object_getClass(self);
+    class_addMethod(meta, name, (IMP)wa_noop, "v@:");
+    return YES;
 }
 
 // ---------- v2: nil-guard +[NSURL fileURLWithPath:] ----------
@@ -72,9 +96,6 @@ static NSString *wa_realTsv(void) {
     return g_realTsv;
 }
 
-// Build a real NSDictionary out of countries.tsv. Format per line:
-//   ISO \t CC \t ITU \t LEN \t MNP \t FORMATS \t REPL \t AREA \t DIALLEN \t REGION
-// We keep keys = ISO codes (like the real DB) with a small value dict.
 static NSDictionary *wa_buildCountryDB(void) {
     if (g_fakeCountryDB) return g_fakeCountryDB;
     NSString *txt = wa_realTsv();
@@ -86,7 +107,7 @@ static NSDictionary *wa_buildCountryDB(void) {
         NSString *iso = f[0];
         if (iso.length != 2) continue;
         out[iso] = @{
-            @"cc": f[1],                 // country/ITU code as string
+            @"cc": f[1],
             @"itu": f[2],
             @"iso": iso,
         };
@@ -126,7 +147,7 @@ static BOOL wa_fileExistsIsDir(id self, SEL _cmd, NSString *path, BOOL *isDir) {
     return ((BOOL (*)(id, SEL, NSString *, BOOL *))orig_fileExistsIsDir)(self, _cmd, path, isDir);
 }
 
-// ---------- v5: NSString file readers (TSV is text!) ----------
+// ---------- v5: NSString file readers ----------
 static IMP orig_strFile = NULL;
 static NSString *wa_strFile(id self, SEL _cmd, NSString *path, NSStringEncoding enc, NSError **err) {
     if (wa_isCountryPath(path)) {
@@ -264,7 +285,7 @@ static id wa_dictInitURL(id self, SEL _cmd, NSURL *url) {
     return r;
 }
 
-// -[NSArray initWithContentsOfFile:] — country TSV may be read as an array
+// -[NSArray initWithContentsOfFile:]
 static IMP orig_arrInitFile = NULL;
 static id wa_arrInitFile(id self, SEL _cmd, NSString *path) {
     id r = ((id (*)(id, SEL, NSString *))orig_arrInitFile)(self, _cmd, path);
@@ -310,7 +331,13 @@ static void wa_swizzle_inst(Class cls, SEL sel, IMP imp, IMP *origOut) {
 
 __attribute__((constructor))
 static void wa_init(void) {
-    os_log_info(wa_log(), "waContainerFix v5 constructor running");
+    os_log_info(wa_log(), "waContainerFix v6 constructor running");
+
+    // v6: universal missing-selector synthesis (kills the whole crash family)
+    wa_swizzle([NSObject class], @selector(resolveInstanceMethod:),
+               (IMP)wa_resolveInstance, NULL);
+    wa_swizzle([NSObject class], @selector(resolveClassMethod:),
+               (IMP)wa_resolveClass, NULL);
 
     // v2: NSURL nil guards
     wa_swizzle([NSURL class], @selector(fileURLWithPath:),
@@ -318,17 +345,17 @@ static void wa_init(void) {
     wa_swizzle([NSURL class], @selector(fileURLWithPath:isDirectory:),
                (IMP)wa_fileURLWithPathIsDir, &orig_fileURLWithPathIsDir);
 
-    // v2: fake app-group container -> home (INSTANCE method — the v3 bug!)
+    // v2: fake app-group container -> home
     wa_swizzle_inst([NSFileManager class], @selector(containerURLForSecurityApplicationGroupIdentifier:),
                     (IMP)wa_containerURL, &orig_containerURL);
 
-    // v5: fileExistsAtPath discovery (logs the exact loader path)
+    // v5: fileExistsAtPath discovery
     wa_swizzle_inst([NSFileManager class], @selector(fileExistsAtPath:),
                     (IMP)wa_fileExists, &orig_fileExists);
     wa_swizzle_inst([NSFileManager class], @selector(fileExistsAtPath:isDirectory:),
                     (IMP)wa_fileExistsIsDir, &orig_fileExistsIsDir);
 
-    // v5: NSString readers (countries.tsv is TEXT)
+    // v5: NSString readers
     wa_swizzle([NSString class], @selector(stringWithContentsOfFile:encoding:error:),
                (IMP)wa_strFile, &orig_strFile);
     wa_swizzle_inst([NSString class], @selector(initWithContentsOfFile:encoding:error:),
@@ -342,7 +369,7 @@ static void wa_init(void) {
     wa_swizzle_inst([NSData class], @selector(initWithContentsOfFile:),
                     (IMP)wa_dataInitFile, &orig_dataInitFile);
 
-    // v5: error:-variant dict/array readers (modern API)
+    // v5: error:-variant dict/array readers
     wa_swizzle([NSDictionary class], @selector(dictionaryWithContentsOfURL:error:),
                (IMP)wa_dictURLErr, &orig_dictURLErr);
     wa_swizzle_inst([NSDictionary class], @selector(initWithContentsOfURL:error:),
@@ -352,7 +379,7 @@ static void wa_init(void) {
     wa_swizzle_inst([NSArray class], @selector(initWithContentsOfURL:error:),
                     (IMP)wa_arrInitURLErr, &orig_arrInitURLErr);
 
-    // v3/v4: country DB synthesis on read-failure — class + INSTANCE variants
+    // v3/v4: country DB synthesis on read-failure
     wa_swizzle([NSDictionary class], @selector(dictionaryWithContentsOfFile:),
                (IMP)wa_dictFile, &orig_dictFile);
     wa_swizzle([NSDictionary class], @selector(dictionaryWithContentsOfURL:),
@@ -361,10 +388,8 @@ static void wa_init(void) {
                     (IMP)wa_dictInitFile, &orig_dictInitFile);
     wa_swizzle_inst([NSDictionary class], @selector(initWithContentsOfURL:),
                     (IMP)wa_dictInitURL, &orig_dictInitURL);
-    // NSArray reads (the TSV might be loaded as an array of lines)
     wa_swizzle_inst([NSArray class], @selector(initWithContentsOfFile:),
                     (IMP)wa_arrInitFile, &orig_arrInitFile);
     wa_swizzle_inst([NSArray class], @selector(initWithContentsOfURL:),
                     (IMP)wa_arrInitURL, &orig_arrInitURL);
 }
-
