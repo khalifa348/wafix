@@ -1,4 +1,4 @@
-// waContainerFix v8 — v7 + NULL-origOut crash fix.
+// waContainerFix v9 — v8 + os_log-encode blacklist + de-duped markers.
 // v7 died in constructor: wa_swizzle(..., NULL) dereferenced origOut unconditionally
 //   -> SIGSEGV 0.39s after constructor (marker file proved: crash between
 //   'constructor' marker and 'swizzled resolveInstanceMethod:' marker).
@@ -32,6 +32,14 @@ static os_log_t wa_log(void) {
 //   -> resolveInstanceMethod: re-entered -> infinite recursion -> SIGSEGV.
 //   Now: add to self (the class), guard re-entry, skip classes with real
 //   forwarding (NSProxy-style), return nil from no-op.
+// v9: blacklist os_log's private string-encoding selectors (encodeWithOSLogCoder*)
+//   — v8 flooded: 1518 resolves of NSTaggedPointerString -encodeWithOSLogCoder:
+//   (os_log encodes every NSString arg through it). Stock runtime returns NO
+//   (default forwarding) and works; we must do the same INSTANTLY (no log, no
+//   marker) or we break os_log and churn main-thread file I/O.
+//   Also: markers now de-duplicated — only NEW (class, selector) combos are
+//   written, so a hot selector can't stall launch with 1000s of file writes.
+
 static NSString *wa_markerPath(void) {
     return [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/wafix_marker.txt"];
 }
@@ -51,6 +59,23 @@ static void wa_marker(NSString *line) {
     }
 }
 
+// de-dup: only log a (class, selector) combo once per run
+static NSMutableSet *g_markerSeen = nil;
+static void wa_markerOnce(NSString *line) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ g_markerSeen = [NSMutableSet set]; });
+    if ([g_markerSeen containsObject:line]) return;
+    [g_markerSeen addObject:line];
+    wa_marker(line);
+}
+
+// os_log private encoding path — hands off instantly (stock behavior)
+static BOOL wa_isOsLogSelector(const char *sel) {
+    if (!sel) return NO;
+    if (strstr(sel, "encodeWithOSLogCoder") != NULL) return YES;
+    return NO;
+}
+
 static id wa_noop(id self, SEL _cmd) { return nil; }
 
 // return YES if the class does REAL forwarding (NSProxy-like) — don't hijack it
@@ -64,8 +89,10 @@ static BOOL wa_resolveInstance(id self, SEL _cmd, SEL name) {
     Class cls = (Class)self;
     const char *clsName = class_getName(cls);
     const char *selName = sel_getName(name);
+    // v9: os_log private path — stock behavior, instant NO, no log/marker churn
+    if (wa_isOsLogSelector(selName)) return NO;
     os_log_info(wa_log(), "RESOLVE-INST %s -%s -> no-op", clsName, selName);
-    wa_marker([NSString stringWithFormat:@"RESOLVE-INST %s -%s", clsName, selName]);
+    wa_markerOnce([NSString stringWithFormat:@"RESOLVE-INST %s -%s", clsName, selName]);
     if (wa_hasRealForwarding(cls)) {
         os_log_info(wa_log(), "RESOLVE-INST %s -%s -> forwarding class, hands off", clsName, selName);
         return NO;
@@ -83,8 +110,10 @@ static BOOL wa_resolveClass(id self, SEL _cmd, SEL name) {
     Class meta = object_getClass(self);
     const char *clsName = class_getName(meta);
     const char *selName = sel_getName(name);
+    // v9: os_log private path — stock behavior, instant NO
+    if (wa_isOsLogSelector(selName)) return NO;
     os_log_info(wa_log(), "RESOLVE-CLASS %s +%s -> no-op", clsName, selName);
-    wa_marker([NSString stringWithFormat:@"RESOLVE-CLASS %s +%s", clsName, selName]);
+    wa_markerOnce([NSString stringWithFormat:@"RESOLVE-CLASS %s +%s", clsName, selName]);
     if (wa_hasRealForwarding(meta)) {
         os_log_info(wa_log(), "RESOLVE-CLASS %s +%s -> forwarding class, hands off", clsName, selName);
         return NO;
@@ -387,8 +416,8 @@ static void wa_swizzle_inst(Class cls, SEL sel, IMP imp, IMP *origOut) {
 
 __attribute__((constructor))
 static void wa_init(void) {
-    os_log_info(wa_log(), "waContainerFix v8 constructor running");
-    wa_marker(@"=== waContainerFix v8 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v9 constructor running");
+    wa_marker(@"=== waContainerFix v9 constructor ===");
 
     // v6/v7: universal missing-selector synthesis (kills the whole crash family)
     wa_swizzle([NSObject class], @selector(resolveInstanceMethod:),
