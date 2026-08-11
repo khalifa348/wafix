@@ -24,21 +24,73 @@ static os_log_t wa_log(void) {
 // ---------- v6: universal missing-selector synthesis ----------
 // Called whenever a class fails to find an instance method. We add a no-op
 // implementation so the app keeps running instead of NSInvalidArgumentException.
-static void wa_noop(void) {}
+// v7 FIX: v6 added to object_getClass(self) (metaclass) -> method never found
+//   -> resolveInstanceMethod: re-entered -> infinite recursion -> SIGSEGV.
+//   Now: add to self (the class), guard re-entry, skip classes with real
+//   forwarding (NSProxy-style), return nil from no-op.
+static NSString *wa_markerPath(void) {
+    return [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/wafix_marker.txt"];
+}
+
+static void wa_marker(NSString *line) {
+    @autoreleasepool {
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:wa_markerPath()];
+        if (!fh) {
+            [[NSFileManager defaultManager] createFileAtPath:wa_markerPath() contents:nil attributes:nil];
+            fh = [NSFileHandle fileHandleForWritingAtPath:wa_markerPath()];
+        }
+        if (fh) {
+            [fh seekToEndOfFile];
+            [fh writeData:[[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]];
+            [fh closeFile];
+        }
+    }
+}
+
+static id wa_noop(id self, SEL _cmd) { return nil; }
+
+// return YES if the class does REAL forwarding (NSProxy-like) — don't hijack it
+static BOOL wa_hasRealForwarding(Class cls) {
+    IMP mine = class_getMethodImplementation([NSObject class], @selector(forwardInvocation:));
+    IMP theirs = class_getMethodImplementation(cls, @selector(forwardInvocation:));
+    return theirs != mine;
+}
 
 static BOOL wa_resolveInstance(id self, SEL _cmd, SEL name) {
-    // _cmd is resolveInstanceMethod:; name is the missing selector.
-    const char *cls = class_getName(object_getClass(self));
-    os_log_info(wa_log(), "RESOLVE-INST %s -%s -> no-op", cls, sel_getName(name));
-    class_addMethod(object_getClass(self), name, (IMP)wa_noop, "v@:");
+    Class cls = (Class)self;
+    const char *clsName = class_getName(cls);
+    const char *selName = sel_getName(name);
+    os_log_info(wa_log(), "RESOLVE-INST %s -%s -> no-op", clsName, selName);
+    wa_marker([NSString stringWithFormat:@"RESOLVE-INST %s -%s", clsName, selName]);
+    if (wa_hasRealForwarding(cls)) {
+        os_log_info(wa_log(), "RESOLVE-INST %s -%s -> forwarding class, hands off", clsName, selName);
+        return NO;
+    }
+    if (class_getInstanceMethod(cls, name)) return YES;   // already added (re-entry guard)
+    if (!class_addMethod(cls, name, (IMP)wa_noop, "@@:")) {
+        os_log_fault(wa_log(), "RESOLVE-INST ADD FAIL %s -%s", clsName, selName);
+        return NO;
+    }
+    os_log_info(wa_log(), "RESOLVE-INST %s -%s -> no-op ADDED", clsName, selName);
     return YES;
 }
 
 static BOOL wa_resolveClass(id self, SEL _cmd, SEL name) {
-    const char *cls = class_getName(self);
-    os_log_info(wa_log(), "RESOLVE-CLASS %s +%s -> no-op", cls, sel_getName(name));
     Class meta = object_getClass(self);
-    class_addMethod(meta, name, (IMP)wa_noop, "v@:");
+    const char *clsName = class_getName(meta);
+    const char *selName = sel_getName(name);
+    os_log_info(wa_log(), "RESOLVE-CLASS %s +%s -> no-op", clsName, selName);
+    wa_marker([NSString stringWithFormat:@"RESOLVE-CLASS %s +%s", clsName, selName]);
+    if (wa_hasRealForwarding(meta)) {
+        os_log_info(wa_log(), "RESOLVE-CLASS %s +%s -> forwarding class, hands off", clsName, selName);
+        return NO;
+    }
+    if (class_getClassMethod(meta, name)) return YES;      // already added (re-entry guard)
+    if (!class_addMethod(meta, name, (IMP)wa_noop, "@@:")) {
+        os_log_fault(wa_log(), "RESOLVE-CLASS ADD FAIL %s +%s", clsName, selName);
+        return NO;
+    }
+    os_log_info(wa_log(), "RESOLVE-CLASS %s +%s -> no-op ADDED", clsName, selName);
     return YES;
 }
 
@@ -331,13 +383,16 @@ static void wa_swizzle_inst(Class cls, SEL sel, IMP imp, IMP *origOut) {
 
 __attribute__((constructor))
 static void wa_init(void) {
-    os_log_info(wa_log(), "waContainerFix v6 constructor running");
+    os_log_info(wa_log(), "waContainerFix v7 constructor running");
+    wa_marker(@"=== waContainerFix v7 constructor ===");
 
-    // v6: universal missing-selector synthesis (kills the whole crash family)
+    // v6/v7: universal missing-selector synthesis (kills the whole crash family)
     wa_swizzle([NSObject class], @selector(resolveInstanceMethod:),
                (IMP)wa_resolveInstance, NULL);
+    wa_marker(@"swizzled resolveInstanceMethod:");
     wa_swizzle([NSObject class], @selector(resolveClassMethod:),
                (IMP)wa_resolveClass, NULL);
+    wa_marker(@"swizzled resolveClassMethod:");
 
     // v2: NSURL nil guards
     wa_swizzle([NSURL class], @selector(fileURLWithPath:),
