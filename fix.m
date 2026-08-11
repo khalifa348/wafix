@@ -38,6 +38,9 @@
 #import <mach-o/dyld.h>
 #import <dlfcn.h>
 
+// forward decl (wa_marker defined later in file)
+static void wa_marker(NSString *line);
+
 // ---------- v10: dyld interpose (anti-tamper evasion) ----------
 // Real function pointers captured from libdyld (RTLD_NEXT skips our image).
 static uint32_t (*real_dyld_image_count)(void);
