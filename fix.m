@@ -1,4 +1,4 @@
-// waContainerFix v12 — v10 + lazy interpose init (reals valid pre-constructor)
+// waContainerFix v13 — v10 + lazy interpose init (reals valid pre-constructor)
 // + resolver rewritten: no class_getInstanceMethod/class_getMethodImplementation/
 // os_log inside resolver (all three re-enter resolveMethod_locked -> infinite
 // recursion -> stack overflow. ME40 crash 03:18:59: 6+ alternating frames).
@@ -66,24 +66,21 @@ static int g_realsInited = 0;
 
 static void wa_antiDetectInit(void) {
     if (g_realsInited) return;
-    // v12: capture reals via EXPLICIT libdyld handle (dlopen+dlsym(handle)).
-    // NEVER dlsym(RTLD_NEXT, ...) from an interposer: our dylib is the LAST
-    // image in load order (LIEF appended LC_LOAD_DYLIB), so RTLD_NEXT has
-    // nothing after us and dyld4 aborts the process (silent death, v11
-    // lesson: marker stopped after constructor, no crash report).
-    // dlsym on an explicit handle searches ONLY that image -> bypasses the
-    // interpose table -> returns the REAL functions.
-    void *libdyld = dlopen("/usr/lib/libdyld.dylib", RTLD_LAZY | RTLD_NOLOAD);
-    if (!libdyld) libdyld = dlopen("/usr/lib/libdyld.dylib", RTLD_LAZY);
-    wa_marker([NSString stringWithFormat:@"antiDetect: libdyld=%p", libdyld]);
-    if (libdyld) {
-        real_dyld_image_count = (uint32_t (*)(void))dlsym(libdyld, "_dyld_image_count");
-        real_dyld_get_image_name = (const char *(*)(uint32_t))dlsym(libdyld, "_dyld_get_image_name");
-        real_dyld_get_image_header = (const struct mach_header *(*)(uint32_t))dlsym(libdyld, "_dyld_get_image_header");
-        real_dyld_register_func_for_add_image = (void (*)(void (*)(const struct mach_header *, intptr_t)))dlsym(libdyld, "_dyld_register_func_for_add_image");
-        real_dyld_register_func_for_remove_image = (void (*)(void (*)(const struct mach_header *, intptr_t)))dlsym(libdyld, "_dyld_register_func_for_remove_image");
-        real_dladdr = (int (*)(const void *, Dl_info *))dlsym(libdyld, "dladdr");
-    }
+    // v13: capture reals via dlsym(RTLD_DEFAULT, ...). Our fake replacements
+    // are STATIC functions (never exported), so RTLD_DEFAULT finds the REAL
+    // exports in libdyld. dyld4's dlsym is interpose-aware: it returns the
+    // ORIGINAL definition for interposed symbols.
+    // (v11 lesson: RTLD_NEXT from our dylib = SILENT DEATH, we're the last
+    // image in load order and there's no "next" — dyld4 aborts the process.
+    // v12 lesson: dlopen("/usr/lib/libdyld.dylib") returned NULL on iOS 26
+    // from inside a constructor — reals stayed NULL -> fakes returned
+    // count=0/dladdr=0 process-wide -> system breakage -> silent death.)
+    real_dyld_image_count = (uint32_t (*)(void))dlsym(RTLD_DEFAULT, "_dyld_image_count");
+    real_dyld_get_image_name = (const char *(*)(uint32_t))dlsym(RTLD_DEFAULT, "_dyld_get_image_name");
+    real_dyld_get_image_header = (const struct mach_header *(*)(uint32_t))dlsym(RTLD_DEFAULT, "_dyld_get_image_header");
+    real_dyld_register_func_for_add_image = (void (*)(void (*)(const struct mach_header *, intptr_t)))dlsym(RTLD_DEFAULT, "_dyld_register_func_for_add_image");
+    real_dyld_register_func_for_remove_image = (void (*)(void (*)(const struct mach_header *, intptr_t)))dlsym(RTLD_DEFAULT, "_dyld_register_func_for_remove_image");
+    real_dladdr = (int (*)(const void *, Dl_info *))dlsym(RTLD_DEFAULT, "dladdr");
     wa_marker([NSString stringWithFormat:@"antiDetect: reals count=%p name=%p hdr=%p dladdr=%p",
                real_dyld_image_count, real_dyld_get_image_name,
                real_dyld_get_image_header, real_dladdr]);
@@ -583,8 +580,8 @@ static void wa_swizzle_inst(Class cls, SEL sel, IMP imp, IMP *origOut) {
 
 __attribute__((constructor))
 static void wa_init(void) {
-    os_log_info(wa_log(), "waContainerFix v12 constructor running");
-    wa_marker(@"=== waContainerFix v12 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v13 constructor running");
+    wa_marker(@"=== waContainerFix v13 constructor ===");
 
     // v10/v11: anti-tamper evasion — init dyld interpose reals FIRST so the
     // fakes are correct before any swizzle/launch activity
