@@ -1,4 +1,4 @@
-// waContainerFix v13 — v10 + lazy interpose init (reals valid pre-constructor)
+// waContainerFix v14 — v10 + lazy interpose init (reals valid pre-constructor)
 // + resolver rewritten: no class_getInstanceMethod/class_getMethodImplementation/
 // os_log inside resolver (all three re-enter resolveMethod_locked -> infinite
 // recursion -> stack overflow. ME40 crash 03:18:59: 6+ alternating frames).
@@ -66,6 +66,15 @@ static int g_realsInited = 0;
 
 static void wa_antiDetectInit(void) {
     if (g_realsInited) return;
+    // v14 FIX (crash: re-entrancy flood): set the guard FIRST. v13 set it at
+    // the END -> wa_marker -> Foundation file I/O -> internal dladdr()
+    // (interposed!) -> wa_fake_dladdr -> wa_antiDetectInit re-entered with
+    // flag still 0 -> wrote "antiDetect: reals" marker recursively, init
+    // NEVER completed (no "ourHeader" line ever), app died silently ~60-90s
+    // (tamper timer, no crash report). With the guard set first, any
+    // interposed call during init just runs the fakes with partially-set
+    // reals (safe: they null-check before use).
+    g_realsInited = 1;
     // v13: capture reals via dlsym(RTLD_DEFAULT, ...). Our fake replacements
     // are STATIC functions (never exported), so RTLD_DEFAULT finds the REAL
     // exports in libdyld. dyld4's dlsym is interpose-aware: it returns the
@@ -580,8 +589,8 @@ static void wa_swizzle_inst(Class cls, SEL sel, IMP imp, IMP *origOut) {
 
 __attribute__((constructor))
 static void wa_init(void) {
-    os_log_info(wa_log(), "waContainerFix v13 constructor running");
-    wa_marker(@"=== waContainerFix v13 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v14 constructor running");
+    wa_marker(@"=== waContainerFix v14 constructor ===");
 
     // v10/v11: anti-tamper evasion — init dyld interpose reals FIRST so the
     // fakes are correct before any swizzle/launch activity
