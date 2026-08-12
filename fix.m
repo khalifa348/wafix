@@ -47,84 +47,57 @@
 static void wa_marker(NSString *line);
 
 // ---------- v10: dyld interpose (anti-tamper evasion) ----------
-// Real function pointers captured from libdyld. MUST be captured lazily on
-// first use (NOT only in the constructor): dyld applies the __interpose
-// section the moment our image loads — BEFORE the constructor runs — so
-// WhatsApp's +load methods can hit our fakes with uninitialized reals
-// (v11 lesson: v10's constructor-only init left reals NULL -> dladdr failed
-// for the whole process -> system frameworks broke -> resolver recursion).
-static uint32_t (*real_dyld_image_count)(void);
-static const char *(*real_dyld_get_image_name)(uint32_t index);
-static const struct mach_header *(*real_dyld_get_image_header)(uint32_t index);
-static void (*real_dyld_register_func_for_add_image)(void (*)(const struct mach_header *mh, intptr_t vmaddr_slide));
-static void (*real_dyld_register_func_for_remove_image)(void (*)(const struct mach_header *mh, intptr_t vmaddr_slide));
-static int (*real_dladdr)(const void *, Dl_info *);
-
+// v15: no real_* function pointers — the fakes call the imported symbols
+// DIRECTLY (dyld resolves the interposer's own imports to the REAL libdyld
+// functions; it never self-interposes, so no capture is needed).
 static const struct mach_header *g_ourHeader = NULL;
 static uint32_t g_ourIndex = UINT32_MAX;
 static int g_realsInited = 0;
 
 static void wa_antiDetectInit(void) {
     if (g_realsInited) return;
-    // v14 FIX (crash: re-entrancy flood): set the guard FIRST. v13 set it at
-    // the END -> wa_marker -> Foundation file I/O -> internal dladdr()
-    // (interposed!) -> wa_fake_dladdr -> wa_antiDetectInit re-entered with
-    // flag still 0 -> wrote "antiDetect: reals" marker recursively, init
-    // NEVER completed (no "ourHeader" line ever), app died silently ~60-90s
-    // (tamper timer, no crash report). With the guard set first, any
-    // interposed call during init just runs the fakes with partially-set
-    // reals (safe: they null-check before use).
+    // v15: NO dlsym capture AT ALL. v14/v13 lesson: dlsym(RTLD_DEFAULT, ...)
+    // for an interposed symbol returns the INTERPOSED REPLACEMENT (our own
+    // fake — the captured "reals" were app-region addresses == our dylib!),
+    // so calling the captured pointer recursed into ourselves and died
+    // before init completed. The CORRECT pattern for an interposer: call
+    // the imported symbol DIRECTLY — dyld resolves our own imports to the
+    // REAL libdyld functions (it never self-interposes the interposer).
     g_realsInited = 1;
-    // v13: capture reals via dlsym(RTLD_DEFAULT, ...). Our fake replacements
-    // are STATIC functions (never exported), so RTLD_DEFAULT finds the REAL
-    // exports in libdyld. dyld4's dlsym is interpose-aware: it returns the
-    // ORIGINAL definition for interposed symbols.
-    // (v11 lesson: RTLD_NEXT from our dylib = SILENT DEATH, we're the last
-    // image in load order and there's no "next" — dyld4 aborts the process.
-    // v12 lesson: dlopen("/usr/lib/libdyld.dylib") returned NULL on iOS 26
-    // from inside a constructor — reals stayed NULL -> fakes returned
-    // count=0/dladdr=0 process-wide -> system breakage -> silent death.)
-    real_dyld_image_count = (uint32_t (*)(void))dlsym(RTLD_DEFAULT, "_dyld_image_count");
-    real_dyld_get_image_name = (const char *(*)(uint32_t))dlsym(RTLD_DEFAULT, "_dyld_get_image_name");
-    real_dyld_get_image_header = (const struct mach_header *(*)(uint32_t))dlsym(RTLD_DEFAULT, "_dyld_get_image_header");
-    real_dyld_register_func_for_add_image = (void (*)(void (*)(const struct mach_header *, intptr_t)))dlsym(RTLD_DEFAULT, "_dyld_register_func_for_add_image");
-    real_dyld_register_func_for_remove_image = (void (*)(void (*)(const struct mach_header *, intptr_t)))dlsym(RTLD_DEFAULT, "_dyld_register_func_for_remove_image");
-    real_dladdr = (int (*)(const void *, Dl_info *))dlsym(RTLD_DEFAULT, "dladdr");
-    wa_marker([NSString stringWithFormat:@"antiDetect: reals count=%p name=%p hdr=%p dladdr=%p",
-               real_dyld_image_count, real_dyld_get_image_name,
-               real_dyld_get_image_header, real_dladdr]);
-    // our own header via dladdr on our code
+    // our own header via dladdr on our code (direct call = real dladdr)
     Dl_info info;
-    if (real_dladdr && real_dladdr((const void *)&wa_antiDetectInit, &info)) {
+    if (dladdr((const void *)&wa_antiDetectInit, &info)) {
         g_ourHeader = info.dli_fbase;
     }
-    // our index in the real dyld list
-    if (g_ourHeader && real_dyld_image_count && real_dyld_get_image_header) {
-        uint32_t n = real_dyld_image_count();
+    // our index in the real dyld list (direct calls = real functions)
+    if (g_ourHeader) {
+        uint32_t n = _dyld_image_count();
         for (uint32_t i = 0; i < n; i++) {
-            if (real_dyld_get_image_header(i) == g_ourHeader) { g_ourIndex = i; break; }
+            if (_dyld_get_image_header(i) == g_ourHeader) { g_ourIndex = i; break; }
         }
+        wa_marker([NSString stringWithFormat:@"antiDetect: ourHeader=%p ourIndex=%u count=%u",
+                   g_ourHeader, g_ourIndex, n]);
+    } else {
+        wa_marker(@"antiDetect: ourHeader=NULL (dladdr failed)");
     }
-    wa_marker([NSString stringWithFormat:@"antiDetect: ourHeader=%p ourIndex=%u count=%u",
-               g_ourHeader, g_ourIndex, real_dyld_image_count ? real_dyld_image_count() : 0]);
 }
 
 static uint32_t wa_fake_dyld_image_count(void) {
     wa_antiDetectInit();
-    uint32_t n = real_dyld_image_count ? real_dyld_image_count() : 0;
+    uint32_t n = _dyld_image_count();  // direct call = REAL (no self-interpose)
     return (g_ourIndex < n) ? n - 1 : n;
 }
 
 static const char *wa_fake_dyld_get_image_name(uint32_t index) {
     wa_antiDetectInit();
     if (g_ourIndex != UINT32_MAX && index >= g_ourIndex) index++;
-    return real_dyld_get_image_name ? real_dyld_get_image_name(index) : "";
+    return _dyld_get_image_name(index);  // direct call = REAL
 }
 
 static const struct mach_header *wa_fake_dyld_get_image_header(uint32_t index) {
     wa_antiDetectInit();
     if (g_ourIndex != UINT32_MAX && index >= g_ourIndex) index++;
-    return real_dyld_get_image_header ? real_dyld_get_image_header(index) : NULL;
+    return _dyld_get_image_header(index);  // direct call = REAL
 }
 
 // swallow add/remove image callbacks — the anti-tamper never learns of our dylib
@@ -139,8 +112,7 @@ static void wa_fake_dyld_register_func_for_remove_image(void (*func)(const struc
 // dladdr: return 0 (not found) when the address belongs to our dylib
 static int wa_fake_dladdr(const void *addr, Dl_info *info) {
     wa_antiDetectInit();
-    if (!real_dladdr) return 0;
-    if (real_dladdr(addr, info) == 0) return 0;
+    if (!dladdr(addr, info)) return 0;  // direct call = REAL
     if (info && info->dli_fbase == g_ourHeader) return 0;
     return 1;
 }
@@ -588,8 +560,8 @@ static void wa_swizzle_inst(Class cls, SEL sel, IMP imp, IMP *origOut) {
 
 __attribute__((constructor))
 static void wa_init(void) {
-    os_log_info(wa_log(), "waContainerFix v14 constructor running");
-    wa_marker(@"=== waContainerFix v14 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v15 constructor running");
+    wa_marker(@"=== waContainerFix v15 constructor ===");
 
     // v10/v11: anti-tamper evasion — init dyld interpose reals FIRST so the
     // fakes are correct before any swizzle/launch activity
