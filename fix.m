@@ -105,7 +105,6 @@ static void wa_antiDetectInit(void) {
             if (real_dyld_get_image_header(i) == g_ourHeader) { g_ourIndex = i; break; }
         }
     }
-    g_realsInited = 1;
     wa_marker([NSString stringWithFormat:@"antiDetect: ourHeader=%p ourIndex=%u count=%u",
                g_ourHeader, g_ourIndex, real_dyld_image_count ? real_dyld_image_count() : 0]);
 }
