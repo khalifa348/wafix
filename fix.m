@@ -101,12 +101,46 @@ static const struct mach_header *wa_fake_dyld_get_image_header(uint32_t index) {
 }
 
 // swallow add/remove image callbacks — the anti-tamper never learns of our dylib
+// v16: BRIDGE pass-through for add/remove image callbacks. v15 swallowed
+// them (deliberately dropped) -> WhatsApp's integrity callback registered at
+// startup never fired -> at ~15-20s the tamper concluded dyld was
+// compromised -> clean exit(). Now: register ONE bridge with the REAL dyld;
+// the bridge forwards every callback to the user's callback EXCEPT when the
+// image is OUR dylib (that one call is dropped, so the tamper never learns
+// our name, while ALL legitimate dyld callback consumers work normally).
+static void (*g_wa_cb_add[8])(const struct mach_header *, intptr_t);
+static void (*g_wa_cb_remove[8])(const struct mach_header *, intptr_t);
+static int g_wa_cb_add_count = 0;
+static int g_wa_cb_remove_count = 0;
+
+static void wa_bridge_add(const struct mach_header *mh, intptr_t slide) {
+    if (mh == g_ourHeader) return;  // hide ourselves
+    for (int i = 0; i < g_wa_cb_add_count; i++) {
+        if (g_wa_cb_add[i]) g_wa_cb_add[i](mh, slide);
+    }
+}
+
+static void wa_bridge_remove(const struct mach_header *mh, intptr_t slide) {
+    if (mh == g_ourHeader) return;  // hide ourselves
+    for (int i = 0; i < g_wa_cb_remove_count; i++) {
+        if (g_wa_cb_remove[i]) g_wa_cb_remove[i](mh, slide);
+    }
+}
+
 static void wa_fake_dyld_register_func_for_add_image(void (*func)(const struct mach_header *, intptr_t)) {
-    (void)func;  // deliberately drop
+    wa_antiDetectInit();
+    if (func) {
+        if (g_wa_cb_add_count == 0) _dyld_register_func_for_add_image(wa_bridge_add);  // direct = REAL
+        if (g_wa_cb_add_count < 8) g_wa_cb_add[g_wa_cb_add_count++] = func;
+    }
 }
 
 static void wa_fake_dyld_register_func_for_remove_image(void (*func)(const struct mach_header *, intptr_t)) {
-    (void)func;  // deliberately drop
+    wa_antiDetectInit();
+    if (func) {
+        if (g_wa_cb_remove_count == 0) _dyld_register_func_for_remove_image(wa_bridge_remove);  // direct = REAL
+        if (g_wa_cb_remove_count < 8) g_wa_cb_remove[g_wa_cb_remove_count++] = func;
+    }
 }
 
 // dladdr: return 0 (not found) when the address belongs to our dylib
@@ -560,8 +594,8 @@ static void wa_swizzle_inst(Class cls, SEL sel, IMP imp, IMP *origOut) {
 
 __attribute__((constructor))
 static void wa_init(void) {
-    os_log_info(wa_log(), "waContainerFix v15 constructor running");
-    wa_marker(@"=== waContainerFix v15 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v16 constructor running");
+    wa_marker(@"=== waContainerFix v16 constructor ===");
 
     // v10/v11: anti-tamper evasion — init dyld interpose reals FIRST so the
     // fakes are correct before any swizzle/launch activity
