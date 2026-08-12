@@ -157,9 +157,11 @@ static int wa_fake_dladdr(const void *addr, Dl_info *info) {
     _wa_interpose_##replacee __attribute__((section("__DATA,__interpose"))) = { \
         (const void *)(unsigned long)&replacement, (const void *)(unsigned long)&replacee };
 
-WA_INTERPOSE(wa_fake_dyld_image_count, _dyld_image_count)
-WA_INTERPOSE(wa_fake_dyld_get_image_name, _dyld_get_image_name)
-WA_INTERPOSE(wa_fake_dyld_get_image_header, _dyld_get_image_header)
+// v17 PROBE: interpose ONLY dladdr + callbacks. NO count/name/header hiding.
+// Question: does dladdr-hiding ALONE trip the ~23s fast check? If yes, the
+// fast check is dladdr/consistency-based and ALL hiding is impossible via
+// interpose (→ merge architecture). If death moves to ~150s, the fast check
+// is enumeration-based.
 WA_INTERPOSE(wa_fake_dyld_register_func_for_add_image, _dyld_register_func_for_add_image)
 WA_INTERPOSE(wa_fake_dyld_register_func_for_remove_image, _dyld_register_func_for_remove_image)
 WA_INTERPOSE(wa_fake_dladdr, dladdr)
@@ -594,8 +596,8 @@ static void wa_swizzle_inst(Class cls, SEL sel, IMP imp, IMP *origOut) {
 
 __attribute__((constructor))
 static void wa_init(void) {
-    os_log_info(wa_log(), "waContainerFix v16 constructor running");
-    wa_marker(@"=== waContainerFix v16 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v17 constructor running");
+    wa_marker(@"=== waContainerFix v17 constructor ===");
 
     // v10/v11: anti-tamper evasion — init dyld interpose reals FIRST so the
     // fakes are correct before any swizzle/launch activity
