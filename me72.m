@@ -95,6 +95,7 @@ static void wa_swizzle(Class cls, SEL sel, IMP newImp, void **origOut) {
 
 static void *drive_thread(void *arg) {
     @autoreleasepool {
+        wa_marker(@"[drive] thread entered");
         usleep(5000000); // hooks are set on attempt 1 (~0.5s); let app settle
         wa_marker(@"[drive] self-drive starting (5s post-launch)");
 
@@ -216,7 +217,8 @@ static void waInit(void) {
         wa_marker(@"[init] ME72 constructor complete");
 
         pthread_t t;
-        pthread_create(&t, NULL, drive_thread, NULL);
-        pthread_detach(t);
+        int prc = pthread_create(&t, NULL, drive_thread, NULL);
+        wa_marker([NSString stringWithFormat:@"[init] pthread_create rc=%d", prc]);
+        if (prc == 0) pthread_detach(t);
     }
 }
