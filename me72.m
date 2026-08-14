@@ -74,11 +74,9 @@ static void waInit(void) {
     @autoreleasepool {
         wa_marker(@"=== waContainerFix ME72 (minimal, no machinery) constructor ===");
 
-        // NEVER block the main thread (watchdog/suspension). Retry on a
-        // background queue so the app starts normally and classes that load
-        // late still get hooked.
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
-        for (int attempt = 0; attempt < 12; attempt++) {
+        // dvt-launched test apps get clean-killed ~25s after launch, so the
+        // whole retry window must fit inside ~15s. Sync loop, short sleeps.
+        for (int attempt = 0; attempt < 6; attempt++) {
             Class c1 = NSClassFromString(@"XMPPConnectionMain");
             Class c2 = NSClassFromString(@"XMPP"); // rekey owner (RE-verified)
             Class c3 = NSClassFromString(@"WAMessageDecryptionProcessor");
@@ -101,9 +99,8 @@ static void waInit(void) {
             int hooked = (orig_processPersistedStanza ? 1 : 0) + (orig_preprocessRekey ? 1 : 0) + (orig_processMessage ? 1 : 0);
             if (hooked == 3) break;
             wa_marker([NSString stringWithFormat:@"[init] attempt %d: %d/3 classes hooked", attempt + 1, hooked]);
-            usleep(8000000);
+            usleep(3000000);
         }
         wa_marker(@"[init] ME72 constructor complete");
-        });
     }
 }
