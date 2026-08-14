@@ -52,6 +52,9 @@ static void hook_preprocessRekey(id self, SEL _cmd, id stanza, id completion) {
     orig_preprocessRekey(self, _cmd, stanza, completion);
 }
 
+static int g_rekeyXMPPHooked = 0; // XMPP.XMPP (emulation-proven lead) hooked
+static int g_rekeyAnyHooked = 0;  // some other class carrying the selector hooked
+
 static void (*orig_processMessage)(id, SEL, id, id, id, id, id);
 static void hook_processMessage(id self, SEL _cmd, id msg, id ctx, id src, id deps, id completion) {
     wa_marker([NSString stringWithFormat:@"[hook] processMessage:... msg=%@", msg ? NSStringFromClass([msg class]) : @"nil"]);
@@ -82,24 +85,32 @@ static void waInit(void) {
             Class c3 = NSClassFromString(@"WAMessageDecryptionProcessor");
             if (c1) wa_swizzle(c1, NSSelectorFromString(@"processPersistedStanza:inPersistentStanzaQueue:isFromDeferredNSEMerge:nseMergeCompletion:"), (IMP)hook_processPersistedStanza, (void **)&orig_processPersistedStanza);
             if (c3) wa_swizzle(c3, NSSelectorFromString(@"processMessage:input:cancellationHandle:completion:"), (IMP)hook_processMessage, (void **)&orig_processMessage);
-            if (!c2 && !orig_preprocessRekey) {
-                // No bare "XMPP" class at runtime (it's a Swift module prefix).
-                // Find the real owner by scanning ALL classes for the selector.
+            // Prefer the emulation-proven XMPP.XMPP (Swift) implementation.
+            if (!g_rekeyXMPPHooked) {
+                Class swiftCls = NSClassFromString(@"XMPP.XMPP");
+                if (swiftCls) {
+                    Method m2 = class_getInstanceMethod(swiftCls, NSSelectorFromString(@"preprocessRekeyStanza:completion:"));
+                    if (m2) {
+                        wa_swizzle(swiftCls, NSSelectorFromString(@"preprocessRekeyStanza:completion:"), (IMP)hook_preprocessRekey, (void **)&orig_preprocessRekey);
+                        wa_marker(@"[scan] XMPP.XMPP (Swift) preprocessRekey hooked");
+                        g_rekeyXMPPHooked = 1;
+                    }
+                }
+            }
+            if (!g_rekeyXMPPHooked && !g_rekeyAnyHooked) {
+                // Fallback: hook ANY loaded class carrying the selector.
                 SEL sel = NSSelectorFromString(@"preprocessRekeyStanza:completion:");
                 int n = objc_getClassList(NULL, 0);
                 Class *buf = (Class *)malloc(sizeof(Class) * n);
                 objc_getClassList(buf, n);
-                int found = 0;
                 for (int i = 0; i < n; i++) {
-                    Method m = class_getInstanceMethod(buf[i], sel);
-                    if (m) {
+                    if (class_getInstanceMethod(buf[i], sel)) {
                         wa_swizzle(buf[i], sel, (IMP)hook_preprocessRekey, (void **)&orig_preprocessRekey);
                         wa_marker([NSString stringWithFormat:@"[scan] preprocessRekey owner found: %s", class_getName(buf[i])]);
-                        found = 1;
+                        g_rekeyAnyHooked = 1;
                         break;
                     }
                 }
-                if (!found) wa_marker(@"[scan] preprocessRekey selector not found on any loaded class");
                 free(buf);
             }
             int hooked = (orig_processPersistedStanza ? 1 : 0) + (orig_preprocessRekey ? 1 : 0) + (orig_processMessage ? 1 : 0);
