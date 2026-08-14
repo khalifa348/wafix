@@ -1,0 +1,13 @@
+name: build-inert
+on: [push]
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: compile inert dylib
+        run: xcrun clang -arch arm64 -dynamiclib -framework Foundation -o libwaInert.dylib inert.m
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libwaInert.dylib
+          path: libwaInert.dylib
