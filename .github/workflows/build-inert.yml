@@ -5,9 +5,15 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: compile inert dylib
-        run: xcrun clang -arch arm64 -dynamiclib -framework Foundation -o libwaInert.dylib inert.m
+      - name: compile inert dylib (iOS arm64, same flags as fix.m)
+        run: |
+          xcrun -sdk iphoneos clang -arch arm64 -dynamiclib \
+            -miphoneos-version-min=15.0 -fobjc-arc \
+            -framework Foundation inert.m -o libwaInert.dylib
+          lipo -info libwaInert.dylib
+          file libwaInert.dylib
       - uses: actions/upload-artifact@v4
         with:
           name: libwaInert.dylib
           path: libwaInert.dylib
+          if-no-files-found: error
