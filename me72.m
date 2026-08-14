@@ -97,14 +97,33 @@ static void run_drive_inline(void) {
     // Runs inside waInit on the main thread BEFORE the app can be suspended.
     // Background-app suspension froze the pthread usleep in ME72j (process
     // alive, marker stuck after "thread entered"). Inline = no suspension.
+    //
+    // ME72l: crafted instances/blocks are __unsafe_unretained — ARC's
+    // objc_storeStrong(&self,nil) at scope end triggered dealloc of the
+    // UNINITIALIZED class_createInstance object -> dispatch_channel_cancel(NULL)
+    // SIGSEGV 0x8 (crash 09:22:47, run_drive_inline+380) BEFORE lead2 ran.
+    // Leak the crafted objects deliberately; the process is killed anyway.
     wa_marker(@"[drive] inline drive starting");
+
+    // Lead 2 — OLD unchecked path (the interesting one on 26.22.76).
+    // Run FIRST: if it crashes (expected), we capture it before anything else.
+    if (orig_preprocessRekey) {
+        wa_marker(@"[drive] lead2: calling orig preprocessRekeyStanza:completion:...");
+        Class c = NSClassFromString(@"WACallManagerBase");
+        __unsafe_unretained id self2 = c ? class_createInstance(c, 0) : nil;
+        __unsafe_unretained void (^comp2)(void) = ^{};
+        orig_preprocessRekey(self2, NSSelectorFromString(@"preprocessRekeyStanza:completion:"), nil, comp2);
+        wa_marker(@"[drive] lead2: RETURNED");
+    } else {
+        wa_marker(@"[drive] lead2: SKIP (orig not hooked)");
+    }
 
     // Lead 1 — crafted nseMergeCompletion whose first int32 is huge.
     if (orig_processPersistedStanza) {
         wa_marker(@"[drive] lead1: calling orig with crafted mergeCompletion...");
         Class c = NSClassFromString(@"XMPPConnectionMain");
-        id self1 = c ? class_createInstance(c, 0) : nil;
-        void (^comp)(void) = ^{};
+        __unsafe_unretained id self1 = c ? class_createInstance(c, 0) : nil;
+        __unsafe_unretained void (^comp)(void) = ^{};
         orig_processPersistedStanza(self1,
             NSSelectorFromString(@"processPersistedStanza:inPersistentStanzaQueue:isFromDeferredNSEMerge:nseMergeCompletion:"),
             nil, nil, NO, comp);
@@ -113,23 +132,11 @@ static void run_drive_inline(void) {
         wa_marker(@"[drive] lead1: SKIP (orig not hooked)");
     }
 
-    // Lead 2 — OLD unchecked path (the interesting one on 26.22.76).
-    if (orig_preprocessRekey) {
-        wa_marker(@"[drive] lead2: calling orig preprocessRekeyStanza:completion:...");
-        Class c = NSClassFromString(@"WACallManagerBase");
-        id self2 = c ? class_createInstance(c, 0) : nil;
-        void (^comp2)(void) = ^{};
-        orig_preprocessRekey(self2, NSSelectorFromString(@"preprocessRekeyStanza:completion:"), nil, comp2);
-        wa_marker(@"[drive] lead2: RETURNED");
-    } else {
-        wa_marker(@"[drive] lead2: SKIP (orig not hooked)");
-    }
-
     // Lead 3 — OLD cmp #3 jump table (control).
     if (orig_processMessage) {
         wa_marker(@"[drive] lead3: calling orig processMessage:...");
         Class c = NSClassFromString(@"WAMessageDecryptionProcessor");
-        id self3 = c ? class_createInstance(c, 0) : nil;
+        __unsafe_unretained id self3 = c ? class_createInstance(c, 0) : nil;
         orig_processMessage(self3,
             NSSelectorFromString(@"processMessage:input:cancellationHandle:completion:"),
             nil, nil, nil, nil, nil);
