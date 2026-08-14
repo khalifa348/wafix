@@ -170,7 +170,7 @@ static void run_drive_inline(void) {
         __unsafe_unretained id self3 = craftedInstanceOfClass(c);
         orig_processMessage(self3,
             NSSelectorFromString(@"processMessage:input:cancellationHandle:completion:"),
-            nil, nil, nil, g_emptyComp);
+            nil, nil, nil, nil, nil);
         wa_marker(@"[drive] lead3: RETURNED");
     } else {
         wa_marker(@"[drive] lead3: SKIP (orig not hooked)");
