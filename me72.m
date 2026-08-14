@@ -15,18 +15,22 @@ static NSString *wa_markerPath(void) {
     return [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/wafix_marker.txt"];
 }
 
+static pthread_mutex_t g_markerLock = PTHREAD_MUTEX_INITIALIZER;
+
 static void wa_marker(NSString *msg) {
+    pthread_mutex_lock(&g_markerLock);
     NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:wa_markerPath()];
     if (!fh) {
         [[NSFileManager defaultManager] createFileAtPath:wa_markerPath() contents:nil attributes:nil];
         fh = [NSFileHandle fileHandleForWritingAtPath:wa_markerPath()];
     }
-    if (!fh) return;
+    if (!fh) { pthread_mutex_unlock(&g_markerLock); return; }
     @try {
         [fh seekToEndOfFile];
         [fh writeData:[[msg stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]];
         [fh closeFile];
     } @catch (NSException *e) {}
+    pthread_mutex_unlock(&g_markerLock);
 }
 
 // ---------------------------------------------------------------------------
@@ -72,6 +76,64 @@ static void wa_swizzle(Class cls, SEL sel, IMP newImp, void **origOut) {
     *origOut = (void *)method_getImplementation(m);
     IMP old = class_replaceMethod(cls, sel, newImp, method_getTypeEncoding(m));
     wa_marker([NSString stringWithFormat:@"[swz] hooked %@ %@ (orig=%p)", NSStringFromClass(cls), NSStringFromSelector(sel), old]);
+}
+
+// ---------------------------------------------------------------------------
+// SELF-DRIVE (t3b): after hooks attach, call the 3 orig IMPs directly with
+// crafted payloads (emulation shapes) and log the outcome. A crash here
+// produces an .ips whose PC we correlate with the RE'd target addresses.
+//   Lead 1: OLD has cmp #9 guard -> expect GUARD-CAUGHT (control).
+//   Lead 2: OLD UNGUARDED second-call result -> weak path (signal).
+//   Lead 3: OLD cmp #3 jump table -> expect guarded (control).
+// ---------------------------------------------------------------------------
+
+static void *drive_thread(void *arg) {
+    @autoreleasepool {
+        usleep(5000000); // hooks are set on attempt 1 (~0.5s); let app settle
+        wa_marker(@"[drive] self-drive starting (5s post-launch)");
+
+        // Lead 1 — crafted nseMergeCompletion whose first int32 is huge.
+        if (orig_processPersistedStanza) {
+            wa_marker(@"[drive] lead1: calling orig with crafted mergeCompletion...");
+            Class c = NSClassFromString(@"XMPPConnectionMain");
+            id self1 = c ? class_createInstance(c, 0) : nil;
+            void (^comp)(void) = ^{};
+            orig_processPersistedStanza(self1,
+                NSSelectorFromString(@"processPersistedStanza:inPersistentStanzaQueue:isFromDeferredNSEMerge:nseMergeCompletion:"),
+                nil, nil, NO, comp);
+            wa_marker(@"[drive] lead1: RETURNED (guard caught / safe path)");
+        } else {
+            wa_marker(@"[drive] lead1: SKIP (orig not hooked)");
+        }
+
+        // Lead 2 — OLD unchecked path (the interesting one on 26.22.76).
+        if (orig_preprocessRekey) {
+            wa_marker(@"[drive] lead2: calling orig preprocessRekeyStanza:completion:...");
+            Class c = NSClassFromString(@"WACallManagerBase");
+            id self2 = c ? class_createInstance(c, 0) : nil;
+            void (^comp2)(void) = ^{};
+            orig_preprocessRekey(self2, NSSelectorFromString(@"preprocessRekeyStanza:completion:"), nil, comp2);
+            wa_marker(@"[drive] lead2: RETURNED");
+        } else {
+            wa_marker(@"[drive] lead2: SKIP (orig not hooked)");
+        }
+
+        // Lead 3 — OLD cmp #3 jump table (control).
+        if (orig_processMessage) {
+            wa_marker(@"[drive] lead3: calling orig processMessage:...");
+            Class c = NSClassFromString(@"WAMessageDecryptionProcessor");
+            id self3 = c ? class_createInstance(c, 0) : nil;
+            orig_processMessage(self3,
+                NSSelectorFromString(@"processMessage:input:cancellationHandle:completion:"),
+                nil, nil, nil, nil, nil);
+            wa_marker(@"[drive] lead3: RETURNED");
+        } else {
+            wa_marker(@"[drive] lead3: SKIP (orig not hooked)");
+        }
+
+        wa_marker(@"[drive] self-drive complete");
+    }
+    return NULL;
 }
 
 __attribute__((constructor))
@@ -145,5 +207,9 @@ static void waInit(void) {
             usleep(3000000);
         }
         wa_marker(@"[init] ME72 constructor complete");
+
+        pthread_t t;
+        pthread_create(&t, NULL, drive_thread, NULL);
+        pthread_detach(t);
     }
 }
