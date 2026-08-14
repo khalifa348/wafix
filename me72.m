@@ -35,34 +35,27 @@ static void wa_marker(NSString *msg) {
 // contents: "TRIGGER:1" enables crafted input for lead 1.
 // ---------------------------------------------------------------------------
 
-// Lead 1: XMPPConnectionMain processPersistedStanza: — NEW build indexes a block
-// field with NO bounds check (emulation-proven: OOB byte offsets fault).
-// On the OLD build (26.22.76 = our base), the guard EXISTS (cmp #9; b.hi).
-// We can't reproduce the NEW-bug on OLD base directly; instead we verify the
-// OLD guard actually blocks (sanity) and prepare the call path for the 26.30.77
-// baseline later. For now: instrument and log.
+// REAL selectors from objc_methods dumps (OLD 26.22.76 = our base):
+//   Lead 1: XMPPConnectionMain processPersistedStanza:inPersistentStanzaQueue:isFromDeferredNSEMerge:nseMergeCompletion:  0x102a69c88
+//   Lead 2: XMPP preprocessRekeyStanza:completion:  0x104810d20
+//   Lead 3: WAMessageDecryptionProcessor processMessage:input:cancellationHandle:completion:  0x102fda67c
 
-static void (*orig_processPersistedStanza)(id, SEL, id);
-static void hook_processPersistedStanza(id self, SEL _cmd, id stanza) {
-    wa_marker([NSString stringWithFormat:@"[hook] processPersistedStanza: stanza=%@", stanza ? NSStringFromClass([stanza class]) : @"nil"]);
-    orig_processPersistedStanza(self, _cmd, stanza);
+static void (*orig_processPersistedStanza)(id, SEL, id, id, BOOL, id);
+static void hook_processPersistedStanza(id self, SEL _cmd, id stanza, id queue, BOOL deferred, id mergeCompletion) {
+    wa_marker([NSString stringWithFormat:@"[hook] processPersistedStanza:inPersistentStanzaQueue:... stanza=%@", stanza ? NSStringFromClass([stanza class]) : @"nil"]);
+    orig_processPersistedStanza(self, _cmd, stanza, queue, deferred, mergeCompletion);
 }
 
-// Lead 2: preprocessRekeyStanza:completion: — NEW added guard cmp #2; b.lo.
-// OLD (our base) had NO check at the equivalent spot -> feed a rekey stanza with
-// low count to see if OLD handles it (it should, no crash) — documents the delta.
 static void (*orig_preprocessRekey)(id, SEL, id, id);
 static void hook_preprocessRekey(id self, SEL _cmd, id stanza, id completion) {
-    wa_marker(@"[hook] preprocessRekeyStanza:completion: called");
+    wa_marker([NSString stringWithFormat:@"[hook] preprocessRekeyStanza:completion: stanza=%@", stanza ? NSStringFromClass([stanza class]) : @"nil"]);
     orig_preprocessRekey(self, _cmd, stanza, completion);
 }
 
-// Lead 3: WAMessageDecryptionProcessor processMessage: — OLD used cmp #3; b.hi
-// jump table, NEW object-dispatch + null-check. Instrument calls.
-static void (*orig_processMessage)(id, SEL, id);
-static void hook_processMessage(id self, SEL _cmd, id msg) {
-    wa_marker(@"[hook] processMessage: called");
-    orig_processMessage(self, _cmd, msg);
+static void (*orig_processMessage)(id, SEL, id, id, id, id, id);
+static void hook_processMessage(id self, SEL _cmd, id msg, id ctx, id src, id deps, id completion) {
+    wa_marker([NSString stringWithFormat:@"[hook] processMessage:... msg=%@", msg ? NSStringFromClass([msg class]) : @"nil"]);
+    orig_processMessage(self, _cmd, msg, ctx, src, deps, completion);
 }
 
 static void wa_swizzle(Class cls, SEL sel, IMP newImp, void **origOut) {
@@ -84,13 +77,13 @@ static void waInit(void) {
         // Classes may not exist at constructor time on newer iOS; retry lazily
         // from a dispatch_after since we are in the app's main thread context.
         // Simple approach: try now, and again in 5s / 15s.
-        for (int attempt = 0; attempt < 3; attempt++) {
+        for (int attempt = 0; attempt < 8; attempt++) {
             Class c1 = NSClassFromString(@"XMPPConnectionMain");
-            Class c2 = NSClassFromString(@"WAIncomingStanzaProcessor"); // rekey owner (verify at runtime)
+            Class c2 = NSClassFromString(@"XMPP"); // rekey owner (RE-verified)
             Class c3 = NSClassFromString(@"WAMessageDecryptionProcessor");
-            if (c1) wa_swizzle(c1, NSSelectorFromString(@"processPersistedStanza:"), (IMP)hook_processPersistedStanza, (void **)&orig_processPersistedStanza);
+            if (c1) wa_swizzle(c1, NSSelectorFromString(@"processPersistedStanza:inPersistentStanzaQueue:isFromDeferredNSEMerge:nseMergeCompletion:"), (IMP)hook_processPersistedStanza, (void **)&orig_processPersistedStanza);
             if (c2) wa_swizzle(c2, NSSelectorFromString(@"preprocessRekeyStanza:completion:"), (IMP)hook_preprocessRekey, (void **)&orig_preprocessRekey);
-            if (c3) wa_swizzle(c3, NSSelectorFromString(@"processMessage:"), (IMP)hook_processMessage, (void **)&orig_processMessage);
+            if (c3) wa_swizzle(c3, NSSelectorFromString(@"processMessage:input:cancellationHandle:completion:"), (IMP)hook_processMessage, (void **)&orig_processMessage);
             int hooked = (orig_processPersistedStanza ? 1 : 0) + (orig_preprocessRekey ? 1 : 0) + (orig_processMessage ? 1 : 0);
             if (hooked == 3) break;
             wa_marker([NSString stringWithFormat:@"[init] attempt %d: %d/3 classes hooked", attempt + 1, hooked]);
