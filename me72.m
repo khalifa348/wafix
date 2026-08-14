@@ -3,6 +3,11 @@
 // NO country-DB synthesis, NO hiding. ME71b proved machinery-free loads clean.
 // Goal: drive the 3 emulation-proven leads with crafted values on-device.
 //
+// ME72j: FAST constructor. Crash forensics (WhatsApp .ips 07:11/07:13) showed
+// the 6x3s=18s retry loop exceeding the 20s process-launch watchdog allowance
+// -> SIGKILL "app doesn't stay". Hooks all attach on attempt 1 (marker-proven),
+// so retries shrink to 4x250ms (~1s total).
+//
 // Strategy: hook the vulnerable entry points via ObjC method swizzling ONLY
 // (no dyld interpose), feed out-of-range values, log what happens to marker file.
 // If a crafted value crashes the app -> on-device proof of the lead.
@@ -141,9 +146,10 @@ static void waInit(void) {
     @autoreleasepool {
         wa_marker(@"=== waContainerFix ME72 (minimal, no machinery) constructor ===");
 
-        // dvt-launched test apps get clean-killed ~25s after launch, so the
-        // whole retry window must fit inside ~15s. Sync loop, short sleeps.
-        for (int attempt = 0; attempt < 6; attempt++) {
+        // ME72j: process-launch watchdog allows only 20s TOTAL (crash logs
+        // 07:11/07:13 proved 18s of usleep -> SIGKILL). Hooks attach on
+        // attempt 1 anyway; keep 4x250ms retries for late-registering classes.
+        for (int attempt = 0; attempt < 4; attempt++) {
             Class c1 = NSClassFromString(@"XMPPConnectionMain");
             Class c3 = NSClassFromString(@"WAMessageDecryptionProcessor");
             if (!g_persistHooked && c1) {
@@ -204,7 +210,7 @@ static void waInit(void) {
             }
             int hooked = (orig_processPersistedStanza ? 1 : 0) + (orig_preprocessRekey ? 1 : 0) + (orig_processMessage ? 1 : 0);
             wa_marker([NSString stringWithFormat:@"[init] attempt %d: %d/3 classes hooked", attempt + 1, hooked]);
-            usleep(3000000);
+            usleep(250000);
         }
         wa_marker(@"[init] ME72 constructor complete");
 
