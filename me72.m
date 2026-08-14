@@ -88,29 +88,33 @@ static void waInit(void) {
             // Prefer the emulation-proven XMPP.XMPP (Swift) implementation.
             if (!g_rekeyXMPPHooked) {
                 Class swiftCls = NSClassFromString(@"XMPP.XMPP");
-                if (swiftCls) {
-                    Method m2 = class_getInstanceMethod(swiftCls, NSSelectorFromString(@"preprocessRekeyStanza:completion:"));
-                    if (m2) {
-                        wa_swizzle(swiftCls, NSSelectorFromString(@"preprocessRekeyStanza:completion:"), (IMP)hook_preprocessRekey, (void **)&orig_preprocessRekey);
-                        wa_marker(@"[scan] XMPP.XMPP (Swift) preprocessRekey hooked");
-                        g_rekeyXMPPHooked = 1;
-                    }
+                SEL rkSel = NSSelectorFromString(@"preprocessRekeyStanza:completion:");
+                Method m2 = swiftCls ? class_getInstanceMethod(swiftCls, rkSel) : NULL;
+                wa_marker([NSString stringWithFormat:@"[scan] XMPP.XMPP cls=%d mthd=%d", swiftCls ? 1 : 0, m2 ? 1 : 0]);
+                if (m2) {
+                    wa_swizzle(swiftCls, rkSel, (IMP)hook_preprocessRekey, (void **)&orig_preprocessRekey);
+                    wa_marker(@"[scan] XMPP.XMPP (Swift) preprocessRekey hooked");
+                    g_rekeyXMPPHooked = 1;
                 }
             }
             if (!g_rekeyXMPPHooked && !g_rekeyAnyHooked) {
-                // Fallback: hook ANY loaded class carrying the selector.
+                // Fallback: log EVERY loaded class carrying the selector + hook the first.
                 SEL sel = NSSelectorFromString(@"preprocessRekeyStanza:completion:");
                 int n = objc_getClassList(NULL, 0);
                 Class *buf = (Class *)malloc(sizeof(Class) * n);
                 objc_getClassList(buf, n);
+                NSMutableArray *owners = [NSMutableArray array];
                 for (int i = 0; i < n; i++) {
                     if (class_getInstanceMethod(buf[i], sel)) {
-                        wa_swizzle(buf[i], sel, (IMP)hook_preprocessRekey, (void **)&orig_preprocessRekey);
-                        wa_marker([NSString stringWithFormat:@"[scan] preprocessRekey owner found: %s", class_getName(buf[i])]);
-                        g_rekeyAnyHooked = 1;
-                        break;
+                        [owners addObject:[NSString stringWithFormat:@"%s@%p", class_getName(buf[i]), class_getInstanceMethod(buf[i], sel)]];
+                        if (!g_rekeyAnyHooked) {
+                            wa_swizzle(buf[i], sel, (IMP)hook_preprocessRekey, (void **)&orig_preprocessRekey);
+                            wa_marker([NSString stringWithFormat:@"[scan] preprocessRekey owner found: %s", class_getName(buf[i])]);
+                            g_rekeyAnyHooked = 1;
+                        }
                     }
                 }
+                wa_marker([NSString stringWithFormat:@"[scan] all preprocessRekey owners: %@", [owners componentsJoinedByString:@" | "]]);
                 free(buf);
             }
             int hooked = (orig_processPersistedStanza ? 1 : 0) + (orig_preprocessRekey ? 1 : 0) + (orig_processMessage ? 1 : 0);
