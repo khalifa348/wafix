@@ -14,6 +14,7 @@
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
+#import <pthread.h>
 #import <objc/message.h>
 
 static NSString *wa_markerPath(void) {
