@@ -93,6 +93,34 @@ static void wa_swizzle(Class cls, SEL sel, IMP newImp, void **origOut) {
 //   Lead 3: OLD cmp #3 jump table -> expect guarded (control).
 // ---------------------------------------------------------------------------
 
+// ME72m: crafted instances are calloc + manual isa. class_createInstance is
+// CF_RETURNS_RETAINED -> clang emits a balancing objc_release EVEN for
+// __unsafe_unretained (ME72l crash 09:36:58 run_drive_inline+488 = the release
+// call at 0x5148, BEFORE the orig call at 0x51ac) -> dealloc of the
+// uninitialized object -> dispatch_channel_cancel(NULL) SIGSEGV 0x8.
+// calloc+isa has NO +1, ARC never sees it, no release, no dealloc.
+// Instances are deliberately leaked (process is killed anyway).
+static id craftedInstanceOfClass(Class c) {
+    if (!c) return nil;
+    size_t sz = class_getInstanceSize(c);
+    void *mem = calloc(1, sz ? sz : 16);
+    if (!mem) return nil;
+    *(void **)mem = (__bridge void *)c;   // set isa
+    return (__bridge id)mem;
+}
+
+// Empty completion blocks (global constants — no captures, no copy/release).
+static void (^const g_emptyComp)(void) = ^{};
+
+// ME72m: temporary override so OLD lead2 passes its first gate
+// ([self fromDeviceJID] -> cbz bail) and reaches the unchecked
+// isBotChat-result consumption (NEW added cmp x0,#2; b.lo after the same
+// sequence; OLD passes 0/1 through unguarded).
+static id drive_fromDeviceJID(id self, SEL _cmd) {
+    (void)self; (void)_cmd;
+    return (id)@"drive@override.invalid";
+}
+
 static void run_drive_inline(void) {
     // Runs inside waInit on the main thread BEFORE the app can be suspended.
     // Background-app suspension froze the pthread usleep in ME72j (process
@@ -102,7 +130,7 @@ static void run_drive_inline(void) {
     // objc_storeStrong(&self,nil) at scope end triggered dealloc of the
     // UNINITIALIZED class_createInstance object -> dispatch_channel_cancel(NULL)
     // SIGSEGV 0x8 (crash 09:22:47, run_drive_inline+380) BEFORE lead2 ran.
-    // Leak the crafted objects deliberately; the process is killed anyway.
+    // ME72m: calloc+isa instances (no +1, no release) + fromDeviceJID override.
     wa_marker(@"[drive] inline drive starting");
 
     // Lead 2 — OLD unchecked path (the interesting one on 26.22.76).
@@ -110,9 +138,13 @@ static void run_drive_inline(void) {
     if (orig_preprocessRekey) {
         wa_marker(@"[drive] lead2: calling orig preprocessRekeyStanza:completion:...");
         Class c = NSClassFromString(@"WACallManagerBase");
-        __unsafe_unretained id self2 = c ? class_createInstance(c, 0) : nil;
-        __unsafe_unretained void (^comp2)(void) = ^{};
-        orig_preprocessRekey(self2, NSSelectorFromString(@"preprocessRekeyStanza:completion:"), nil, comp2);
+        __unsafe_unretained id self2 = craftedInstanceOfClass(c);
+        // Force fromDeviceJID non-nil so OLD passes its first gate; restore after.
+        Method jidM = c ? class_getInstanceMethod(c, NSSelectorFromString(@"fromDeviceJID")) : NULL;
+        IMP savedJID = jidM ? method_getImplementation(jidM) : NULL;
+        if (jidM) method_setImplementation(jidM, (IMP)drive_fromDeviceJID);
+        orig_preprocessRekey(self2, NSSelectorFromString(@"preprocessRekeyStanza:completion:"), nil, g_emptyComp);
+        if (jidM && savedJID) method_setImplementation(jidM, savedJID);
         wa_marker(@"[drive] lead2: RETURNED");
     } else {
         wa_marker(@"[drive] lead2: SKIP (orig not hooked)");
@@ -122,11 +154,10 @@ static void run_drive_inline(void) {
     if (orig_processPersistedStanza) {
         wa_marker(@"[drive] lead1: calling orig with crafted mergeCompletion...");
         Class c = NSClassFromString(@"XMPPConnectionMain");
-        __unsafe_unretained id self1 = c ? class_createInstance(c, 0) : nil;
-        __unsafe_unretained void (^comp)(void) = ^{};
+        __unsafe_unretained id self1 = craftedInstanceOfClass(c);
         orig_processPersistedStanza(self1,
             NSSelectorFromString(@"processPersistedStanza:inPersistentStanzaQueue:isFromDeferredNSEMerge:nseMergeCompletion:"),
-            nil, nil, NO, comp);
+            nil, nil, NO, g_emptyComp);
         wa_marker(@"[drive] lead1: RETURNED (guard caught / safe path)");
     } else {
         wa_marker(@"[drive] lead1: SKIP (orig not hooked)");
@@ -136,10 +167,10 @@ static void run_drive_inline(void) {
     if (orig_processMessage) {
         wa_marker(@"[drive] lead3: calling orig processMessage:...");
         Class c = NSClassFromString(@"WAMessageDecryptionProcessor");
-        __unsafe_unretained id self3 = c ? class_createInstance(c, 0) : nil;
+        __unsafe_unretained id self3 = craftedInstanceOfClass(c);
         orig_processMessage(self3,
             NSSelectorFromString(@"processMessage:input:cancellationHandle:completion:"),
-            nil, nil, nil, nil, nil);
+            nil, nil, nil, g_emptyComp);
         wa_marker(@"[drive] lead3: RETURNED");
     } else {
         wa_marker(@"[drive] lead3: SKIP (orig not hooked)");
