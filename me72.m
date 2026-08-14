@@ -80,22 +80,28 @@ static void waInit(void) {
             Class c1 = NSClassFromString(@"XMPPConnectionMain");
             Class c2 = NSClassFromString(@"XMPP"); // rekey owner (RE-verified)
             Class c3 = NSClassFromString(@"WAMessageDecryptionProcessor");
-            if (!c2) {
-                // class-list scan: XMPP may be registered under a variant name
+            if (c1) wa_swizzle(c1, NSSelectorFromString(@"processPersistedStanza:inPersistentStanzaQueue:isFromDeferredNSEMerge:nseMergeCompletion:"), (IMP)hook_processPersistedStanza, (void **)&orig_processPersistedStanza);
+            if (c3) wa_swizzle(c3, NSSelectorFromString(@"processMessage:input:cancellationHandle:completion:"), (IMP)hook_processMessage, (void **)&orig_processMessage);
+            if (!c2 && !orig_preprocessRekey) {
+                // No bare "XMPP" class at runtime (it's a Swift module prefix).
+                // Find the real owner by scanning ALL classes for the selector.
+                SEL sel = NSSelectorFromString(@"preprocessRekeyStanza:completion:");
                 int n = objc_getClassList(NULL, 0);
                 Class *buf = (Class *)malloc(sizeof(Class) * n);
                 objc_getClassList(buf, n);
-                NSMutableArray *cands = [NSMutableArray array];
+                int found = 0;
                 for (int i = 0; i < n; i++) {
-                    const char *nm = class_getName(buf[i]);
-                    if (nm && strstr(nm, "XMPP")) [cands addObject:[NSString stringWithUTF8String:nm]];
+                    Method m = class_getInstanceMethod(buf[i], sel);
+                    if (m) {
+                        wa_swizzle(buf[i], sel, (IMP)hook_preprocessRekey, (void **)&orig_preprocessRekey);
+                        wa_marker([NSString stringWithFormat:@"[scan] preprocessRekey owner found: %s", class_getName(buf[i])]);
+                        found = 1;
+                        break;
+                    }
                 }
+                if (!found) wa_marker(@"[scan] preprocessRekey selector not found on any loaded class");
                 free(buf);
-                wa_marker([NSString stringWithFormat:@"[scan] XMPP candidates: %@", [cands componentsJoinedByString:@","]]);
             }
-            if (c1) wa_swizzle(c1, NSSelectorFromString(@"processPersistedStanza:inPersistentStanzaQueue:isFromDeferredNSEMerge:nseMergeCompletion:"), (IMP)hook_processPersistedStanza, (void **)&orig_processPersistedStanza);
-            if (c2) wa_swizzle(c2, NSSelectorFromString(@"preprocessRekeyStanza:completion:"), (IMP)hook_preprocessRekey, (void **)&orig_preprocessRekey);
-            if (c3) wa_swizzle(c3, NSSelectorFromString(@"processMessage:input:cancellationHandle:completion:"), (IMP)hook_processMessage, (void **)&orig_processMessage);
             int hooked = (orig_processPersistedStanza ? 1 : 0) + (orig_preprocessRekey ? 1 : 0) + (orig_processMessage ? 1 : 0);
             if (hooked == 3) break;
             wa_marker([NSString stringWithFormat:@"[init] attempt %d: %d/3 classes hooked", attempt + 1, hooked]);
