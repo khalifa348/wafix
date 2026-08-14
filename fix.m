@@ -1,7 +1,16 @@
-// waContainerFix v14 — v10 + lazy interpose init (reals valid pre-constructor)
-// + resolver rewritten: no class_getInstanceMethod/class_getMethodImplementation/
-// os_log inside resolver (all three re-enter resolveMethod_locked -> infinite
-// recursion -> stack overflow. ME40 crash 03:18:59: 6+ alternating frames).
+// waContainerFix v18 — v17 + FULL hiding restored (count/name/header) +
+// callback REPLAY fix. ME47-ME69 lesson (22 rounds, all RED): v17's probe
+// (interpose ONLY dladdr+callbacks, NO count/name/header hiding) traps at
+// launch in BaseBoard _BSXPCAutoCodingInitialize (EXC_BREAKPOINT/SIGTRAP):
+// with our dylib VISIBLE in the real image list but dladdr DENYING it,
+// Apple's XPC auto-coding init sees an inconsistent dyld state -> trap.
+// v16-style full hiding keeps the list consistent (our image invisible
+// everywhere). ALSO fixed: the add/remove register fakes now REPLAY the
+// already-loaded images to each newly registered callback (real dyld
+// semantics) — v16/v17 stored the callback AFTER registering the bridge, so
+// the bridge's initial replay reached the user callback with an empty list.
+// v14/v13 lesson: dlsym capture self-interposes -> call imported symbols
+// DIRECTLY (dyld never self-interposes the interposer).
 // v11 = v10 dyld-interpose anti-detection + thread-local recursion guards +
 // direct method-list scans + marker-only resolver logging.
 // v9 (ME39) proven: os_log flood GONE (3 unique resolves vs 1518), resolver
@@ -132,6 +141,17 @@ static void wa_fake_dyld_register_func_for_add_image(void (*func)(const struct m
     if (func) {
         if (g_wa_cb_add_count == 0) _dyld_register_func_for_add_image(wa_bridge_add);  // direct = REAL
         if (g_wa_cb_add_count < 8) g_wa_cb_add[g_wa_cb_add_count++] = func;
+        // v18: REPLAY already-loaded images to the new callback (real dyld
+        // registers first, then replays every loaded image synchronously).
+        // v16/v17 stored the callback AFTER registering the bridge, so the
+        // bridge's initial replay fired with an empty list -> BaseBoard's
+        // XPC auto-coding table never populated -> launch trap.
+        uint32_t n = _dyld_image_count();  // direct = REAL
+        for (uint32_t i = 0; i < n; i++) {
+            const struct mach_header *mh = _dyld_get_image_header(i);
+            if (mh == g_ourHeader) continue;
+            func(mh, _dyld_get_image_vmaddr_slide(i));
+        }
     }
 }
 
@@ -157,11 +177,14 @@ static int wa_fake_dladdr(const void *addr, Dl_info *info) {
     _wa_interpose_##replacee __attribute__((section("__DATA,__interpose"))) = { \
         (const void *)(unsigned long)&replacement, (const void *)(unsigned long)&replacee };
 
-// v17 PROBE: interpose ONLY dladdr + callbacks. NO count/name/header hiding.
-// Question: does dladdr-hiding ALONE trip the ~23s fast check? If yes, the
-// fast check is dladdr/consistency-based and ALL hiding is impossible via
-// interpose (→ merge architecture). If death moves to ~150s, the fast check
-// is enumeration-based.
+// v18: FULL hiding restored — interpose count/name/header + dladdr + callbacks.
+// v17 probe (dladdr+callbacks only) answered its question NEGATIVELY: partial
+// hiding leaves our image VISIBLE in the real list while dladdr denies it ->
+// BaseBoard XPC auto-coding init traps at launch (ME47-ME69, 22 RED rounds).
+// Full hiding (v16-style) keeps the image list internally consistent.
+WA_INTERPOSE(wa_fake_dyld_image_count, _dyld_image_count)
+WA_INTERPOSE(wa_fake_dyld_get_image_name, _dyld_get_image_name)
+WA_INTERPOSE(wa_fake_dyld_get_image_header, _dyld_get_image_header)
 WA_INTERPOSE(wa_fake_dyld_register_func_for_add_image, _dyld_register_func_for_add_image)
 WA_INTERPOSE(wa_fake_dyld_register_func_for_remove_image, _dyld_register_func_for_remove_image)
 WA_INTERPOSE(wa_fake_dladdr, dladdr)
@@ -596,8 +619,8 @@ static void wa_swizzle_inst(Class cls, SEL sel, IMP imp, IMP *origOut) {
 
 __attribute__((constructor))
 static void wa_init(void) {
-    os_log_info(wa_log(), "waContainerFix v17 constructor running");
-    wa_marker(@"=== waContainerFix v17 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v18 constructor running");
+    wa_marker(@"=== waContainerFix v18 constructor ===");
 
     // v10/v11: anti-tamper evasion — init dyld interpose reals FIRST so the
     // fakes are correct before any swizzle/launch activity
