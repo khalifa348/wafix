@@ -124,13 +124,11 @@ static id wa_real_instance(Class want) {
 }
 
 static void run_drive_inline(void) {
-    wa_marker(@"[drive] t8 drive start (struct idx2 = 0x7FFFFFFF)");
+    wa_marker(@"[drive] t8 drive start");
 
     int32_t *st = (int32_t *)g_slide_addr(kIndexStructVMA);
     if (!st) { wa_marker(@"[drive] struct NULL — abort"); return; }
-    wa_marker([NSString stringWithFormat:@"[drive] struct @%p before: [+0]=%d [+4]=%d [+0x10]=%d", st, st[0], st[1], st[4]]);
-    st[4] = 0x7FFFFFFF;  // +0x10 slot
-    wa_marker([NSString stringWithFormat:@"[drive] struct @%p after:  [+0x10]=%d", st, st[4]]);
+    wa_marker([NSString stringWithFormat:@"[drive] struct @%p original: [+0]=%d [+4]=%d [+0x10]=%d", st, st[0], st[1], st[4]]);
 
     SEL s1 = NSSelectorFromString(@"fetchPendingRemovalCompanionDevicesForAccountUserJID:");
     SEL s2 = NSSelectorFromString(@"fetchLinkedAndPendingRemovalCompanionDevicesForAccountUserJID:currentDeviceList:");
@@ -145,16 +143,36 @@ static void run_drive_inline(void) {
                realSelf ? @"REAL" : @"NO REAL INSTANCE — skipping calls"]);
 
     if (!realSelf) {
-        wa_marker(@"[drive] ABORT: no real instance — zeroed calloc instance crashes in OUR harness (objc_retain isa=NULL), useless evidence");
+        wa_marker(@"[drive] ABORT: no real instance");
         return;
     }
     id self1 = realSelf;
     id self2 = realSelf;
 
-    // SITE 2 FIRST — v4: prove fetchLinkedAndPendingRemoval... (0x101CA1634) before
+    // ===== CONTROL: call BOTH methods with the ORIGINAL (unpoisoned) struct =====
+    // If the methods return normally, the harness + receiver are valid and the
+    // ONLY variable left is the index value -> proves the poison is the cause.
+    if (orig_fetchLinked && c2 && self2) {
+        wa_marker(@"[ctrl] calling fetchLinkedAndPendingRemoval... (SITE 2, unpoisoned)");
+        orig_fetchLinked(self2, s2, nil, nil);
+        wa_marker(@"[ctrl] fetchLinkedAndPendingRemoval: RETURNED (no crash — harness OK)");
+    }
+    if (orig_fetchPending && c1 && self1) {
+        wa_marker(@"[ctrl] calling fetchPendingRemoval... (SITE 1, unpoisoned)");
+        orig_fetchPending(self1, s1, nil);
+        wa_marker(@"[ctrl] fetchPendingRemoval: RETURNED (no crash — harness OK)");
+    }
+    wa_marker(@"[ctrl] CONTROL PASSED — both methods return normally unpoisoned");
+
+    // ===== POISON: idx2 (+0x10) = 0x7FFFFFFF, then re-call =====
+    int32_t saved = st[4];
+    st[4] = 0x7FFFFFFF;
+    wa_marker([NSString stringWithFormat:@"[drive] struct @%p poisoned: [+0x10]=%d (saved=%d)", st, st[4], saved]);
+
+    // SITE 2 FIRST — prove fetchLinkedAndPendingRemoval... (0x101CA1634) before
     // site 1 so a site-1 crash can't mask it.
     if (orig_fetchLinked && c2 && self2) {
-        wa_marker(@"[drive] calling fetchLinkedAndPendingRemoval... via orig (SITE 2)");
+        wa_marker(@"[drive] calling fetchLinkedAndPendingRemoval... via orig (SITE 2, POISONED)");
         orig_fetchLinked(self2, s2, nil, nil);
         wa_marker(@"[drive] fetchLinkedAndPendingRemoval: RETURNED (no crash)");
     } else {
@@ -162,20 +180,21 @@ static void run_drive_inline(void) {
     }
 
     if (orig_fetchPending && c1 && self1) {
-        wa_marker(@"[drive] calling fetchPendingRemoval... via orig (SITE 1)");
+        wa_marker(@"[drive] calling fetchPendingRemoval... via orig (SITE 1, POISONED)");
         orig_fetchPending(self1, s1, nil);
         wa_marker(@"[drive] fetchPendingRemoval: RETURNED (no crash)");
     } else {
         wa_marker([NSString stringWithFormat:@"[drive] SKIP method1 (orig=%p c1=%p self1=%p)", orig_fetchPending, c1, self1]);
     }
 
+    st[4] = saved;
     wa_marker(@"[drive] t8 drive complete");
 }
 
 __attribute__((constructor))
 static void waInit(void) {
     @autoreleasepool {
-        wa_marker(@"=== waContainerFix ME73b v5 (t8 family, site2-first, real-instance only) constructor ===");
+        wa_marker(@"=== waContainerFix ME73b v6 (t8 family, site2-first, control+poison, delayed drive) constructor ===");
 
         SEL s1 = NSSelectorFromString(@"fetchPendingRemovalCompanionDevicesForAccountUserJID:");
         SEL s2 = NSSelectorFromString(@"fetchLinkedAndPendingRemovalCompanionDevicesForAccountUserJID:currentDeviceList:");
@@ -199,6 +218,11 @@ static void waInit(void) {
         }
         wa_marker(@"[init] ME73b constructor complete");
 
-        run_drive_inline();
+        // Wait for the app to finish initializing (singleton globals are nil at
+        // constructor time — v5 proved that), then drive on a background thread.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                       dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            run_drive_inline();
+        });
     }
 }
