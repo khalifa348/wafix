@@ -138,6 +138,14 @@ static void run_drive_inline(void) {
     if (!c2) c2 = wa_find_class(s2);
 
     id realSelf = wa_real_instance(c1 ?: c2);
+    // v7: poll for the app-global slot — constructor runs BEFORE app init, so the
+    // slot may be nil for the first ~1s. Budget 2.5s (200ms x 12) so we beat the
+    // app's +3s self-crash window (v5/v6 proved that window is real and not ours).
+    for (int tick = 0; !realSelf && tick < 12; tick++) {
+        usleep(200000);
+        realSelf = wa_real_instance(c1 ?: c2);
+        if (!realSelf) wa_marker([NSString stringWithFormat:@"[drive] poll %d: slot still nil", tick + 1]);
+    }
     wa_marker([NSString stringWithFormat:@"[drive] receiver: %@ (%@)",
                realSelf ? NSStringFromClass([realSelf class]) : @"nil",
                realSelf ? @"REAL" : @"NO REAL INSTANCE — skipping calls"]);
@@ -194,7 +202,7 @@ static void run_drive_inline(void) {
 __attribute__((constructor))
 static void waInit(void) {
     @autoreleasepool {
-        wa_marker(@"=== waContainerFix ME73b v6 (t8 family, site2-first, control+poison, delayed drive) constructor ===");
+        wa_marker(@"=== waContainerFix ME73b v7 (t8 family, site2-first, immediate drive + 200ms poll) constructor ===");
 
         SEL s1 = NSSelectorFromString(@"fetchPendingRemovalCompanionDevicesForAccountUserJID:");
         SEL s2 = NSSelectorFromString(@"fetchLinkedAndPendingRemovalCompanionDevicesForAccountUserJID:currentDeviceList:");
@@ -218,11 +226,9 @@ static void waInit(void) {
         }
         wa_marker(@"[init] ME73b constructor complete");
 
-        // Wait for the app to finish initializing (singleton globals are nil at
-        // constructor time — v5 proved that), then drive on a background thread.
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
-                       dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-            run_drive_inline();
-        });
+        // v7: drive IMMEDIATELY (v3-style — beats the app's +3s self-crash
+        // window), polling every 200ms until the app-global slot populates.
+        // dispatch_after(+3s) lost the race in v6 — never use a long delay.
+        run_drive_inline();
     }
 }
