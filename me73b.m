@@ -86,9 +86,11 @@ static Class wa_find_class(SEL sel) {
     return hit;
 }
 
+static int g_hooked = 0;
+
 // real instance from the app's own global (the method loads x20 from this exact slot)
 static id wa_real_instance(Class want) {
-    id *slot = (id *)g_slide_addr(kSingletonVMA);
+    __unsafe_unretained id *slot = (__unsafe_unretained id *)g_slide_addr(kSingletonVMA);
     if (!slot) return nil;
     id obj = *slot;
     if (obj && want && object_isClass(obj) == NO && [obj isKindOfClass:want]) return obj;
@@ -123,11 +125,11 @@ static void run_drive_inline(void) {
     id self1 = realSelf;
     id self2 = realSelf;
     if (!self1 && c1) {
-        self1 = (id)calloc(1, class_getInstanceSize(c1)); // zeroed — no garbage C++ ivars
+        self1 = (__bridge id)calloc(1, class_getInstanceSize(c1)); // zeroed — no garbage C++ ivars
         wa_marker(@"[drive] using ZEROED fallback instance for method1");
     }
     if (!self2 && c2) {
-        self2 = (id)calloc(1, class_getInstanceSize(c2));
+        self2 = (__bridge id)calloc(1, class_getInstanceSize(c2));
         wa_marker(@"[drive] using ZEROED fallback instance for method2");
     }
 
