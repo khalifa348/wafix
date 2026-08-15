@@ -94,10 +94,7 @@ static id wa_real_instance(Class want) {
     if (!slot) return nil;
     id obj = *slot;
     if (obj && want && object_isClass(obj) == NO && [obj isKindOfClass:want]) return obj;
-    // try to find any live instance of want among classes' registered instances is
-    // impossible without private runtime — fall back to singleton selector patterns
-    if (obj && [obj respondsToSelector:@selector(isKindOfClass:)]) return obj; // best effort
-    return nil;
+    return nil; // NOT of the wanted class (global slot may hold unrelated obj) -> zeroed fallback
 }
 
 static void run_drive_inline(void) {
@@ -133,20 +130,22 @@ static void run_drive_inline(void) {
         wa_marker(@"[drive] using ZEROED fallback instance for method2");
     }
 
-    if (orig_fetchPending && c1 && self1) {
-        wa_marker(@"[drive] calling fetchPendingRemoval... via orig");
-        orig_fetchPending(self1, s1, nil);
-        wa_marker(@"[drive] fetchPendingRemoval: RETURNED (no crash)");
-    } else {
-        wa_marker([NSString stringWithFormat:@"[drive] SKIP method1 (orig=%p c1=%p self1=%p)", orig_fetchPending, c1, self1]);
-    }
-
+    // SITE 2 FIRST — v4: prove fetchLinkedAndPendingRemoval... (0x101CA1634) before
+    // site 1 so a site-1 crash can't mask it.
     if (orig_fetchLinked && c2 && self2) {
-        wa_marker(@"[drive] calling fetchLinkedAndPendingRemoval... via orig");
+        wa_marker(@"[drive] calling fetchLinkedAndPendingRemoval... via orig (SITE 2)");
         orig_fetchLinked(self2, s2, nil, nil);
         wa_marker(@"[drive] fetchLinkedAndPendingRemoval: RETURNED (no crash)");
     } else {
         wa_marker([NSString stringWithFormat:@"[drive] SKIP method2 (orig=%p c2=%p self2=%p)", orig_fetchLinked, c2, self2]);
+    }
+
+    if (orig_fetchPending && c1 && self1) {
+        wa_marker(@"[drive] calling fetchPendingRemoval... via orig (SITE 1)");
+        orig_fetchPending(self1, s1, nil);
+        wa_marker(@"[drive] fetchPendingRemoval: RETURNED (no crash)");
+    } else {
+        wa_marker([NSString stringWithFormat:@"[drive] SKIP method1 (orig=%p c1=%p self1=%p)", orig_fetchPending, c1, self1]);
     }
 
     wa_marker(@"[drive] t8 drive complete");
@@ -155,7 +154,7 @@ static void run_drive_inline(void) {
 __attribute__((constructor))
 static void waInit(void) {
     @autoreleasepool {
-        wa_marker(@"=== waContainerFix ME73b v3 (t8 companion-device family) constructor ===");
+        wa_marker(@"=== waContainerFix ME73b v4 (t8 companion-device family, site2-first) constructor ===");
 
         SEL s1 = NSSelectorFromString(@"fetchPendingRemovalCompanionDevicesForAccountUserJID:");
         SEL s2 = NSSelectorFromString(@"fetchLinkedAndPendingRemovalCompanionDevicesForAccountUserJID:currentDeviceList:");
