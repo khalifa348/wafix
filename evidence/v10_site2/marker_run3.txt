@@ -1,0 +1,36 @@
+=== waContainerFix ME73b v10 (t8 family, site2-first, SYNTHETIC-slot fallback, poison-only on synthetic) constructor ===
+[swz] hooked WAOwnDeviceStorageManagerMain fetchPendingRemovalCompanionDevicesForAccountUserJID: (orig=0x102b08dd4)
+[swz] hooked WAOwnDeviceStorageManagerMain fetchLinkedAndPendingRemovalCompanionDevicesForAccountUserJID:currentDeviceList: (orig=0x104605634)
+[init] attempt 1: hooked=2
+[init] ME73b constructor complete
+[drive] t8 drive start
+[drive] struct @0x10a66b44c original: [+0]=40 [+4]=48 [+0x10]=72
+[inst] slot EMPTY — WROTE synthetic NSMutableArray (256 NSNull) into app global
+[drive] receiver: __NSArrayM (SYNTHETIC (v10 wrote own array))
+[ctrl] SKIPPED — synthetic slot (v3.1 poison-only precedent); receiver/table are OUR array
+[drive] struct @0x10a66b44c poisoned: [+0x10]=2147483647 (saved=72)
+[drive] calling fetchLinkedAndPendingRemoval... via orig (SITE 2, POISONED)
+=== waContainerFix ME73b v10 (t8 family, site2-first, SYNTHETIC-slot fallback, poison-only on synthetic) constructor ===
+[swz] hooked WAOwnDeviceStorageManagerMain fetchPendingRemovalCompanionDevicesForAccountUserJID: (orig=0x101074dd4)
+[swz] hooked WAOwnDeviceStorageManagerMain fetchLinkedAndPendingRemovalCompanionDevicesForAccountUserJID:currentDeviceList: (orig=0x102b71634)
+[init] attempt 1: hooked=2
+[init] ME73b constructor complete
+[drive] t8 drive start
+[drive] struct @0x108bd744c original: [+0]=40 [+4]=48 [+0x10]=72
+[inst] slot EMPTY — WROTE synthetic NSMutableArray (256 NSNull) into app global
+[drive] receiver: __NSArrayM (SYNTHETIC (v10 wrote own array))
+[ctrl] SKIPPED — synthetic slot (v3.1 poison-only precedent); receiver/table are OUR array
+[drive] struct @0x108bd744c poisoned: [+0x10]=2147483647 (saved=72)
+[drive] calling fetchLinkedAndPendingRemoval... via orig (SITE 2, POISONED)
+=== waContainerFix ME73b v10 (t8 family, site2-first, SYNTHETIC-slot fallback, poison-only on synthetic) constructor ===
+[swz] hooked WAOwnDeviceStorageManagerMain fetchPendingRemovalCompanionDevicesForAccountUserJID: (orig=0x1022c0dd4)
+[swz] hooked WAOwnDeviceStorageManagerMain fetchLinkedAndPendingRemovalCompanionDevicesForAccountUserJID:currentDeviceList: (orig=0x103dbd634)
+[init] attempt 1: hooked=2
+[init] ME73b constructor complete
+[drive] t8 drive start
+[drive] struct @0x109e2344c original: [+0]=40 [+4]=48 [+0x10]=72
+[inst] slot EMPTY — WROTE synthetic NSMutableArray (256 NSNull) into app global
+[drive] receiver: __NSArrayM (SYNTHETIC (v10 wrote own array))
+[ctrl] SKIPPED — synthetic slot (v3.1 poison-only precedent); receiver/table are OUR array
+[drive] struct @0x109e2344c poisoned: [+0x10]=2147483647 (saved=72)
+[drive] calling fetchLinkedAndPendingRemoval... via orig (SITE 2, POISONED)

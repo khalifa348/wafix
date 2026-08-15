@@ -1,0 +1,198 @@
+{"app_name":"WhatsApp","timestamp":"2026-08-16 02:22:23.00 +0400","app_version":"26.24.72","slice_uuid":"4c4c446e-5555-3144-a192-5e8e0fb8d4cf","build_version":"999852572","platform":2,"bundleID":"net.whatsapp.WhatsAppSMB","share_with_app_devs":1,"is_first_party":0,"bug_type":"309","os_version":"iPhone OS 26.6 (23G71)","roots_installed":0,"name":"WhatsApp","incident_id":"DAE4A7DE-C1EF-46CC-BDAB-D7F937D79977"}
+{
+  "uptime" : 430000,
+  "procRole" : "Foreground",
+  "version" : 2,
+  "userID" : 501,
+  "deployVersion" : 210,
+  "modelCode" : "iPhone18,2",
+  "coalitionID" : 2811,
+  "osVersion" : {
+    "isEmbedded" : true,
+    "train" : "iPhone OS 26.6",
+    "releaseType" : "User",
+    "build" : "23G71"
+  },
+  "captureTime" : "2026-08-16 02:22:23.0507 +0400",
+  "codeSigningMonitor" : 2,
+  "incident" : "DAE4A7DE-C1EF-46CC-BDAB-D7F937D79977",
+  "pid" : 8646,
+  "translated" : false,
+  "cpuType" : "ARM-64",
+  "procLaunch" : "2026-08-16 02:22:22.9096 +0400",
+  "procStartAbsTime" : 10400136144047,
+  "procExitAbsTime" : 10400139525708,
+  "procName" : "WhatsApp",
+  "procPath" : "\/private\/var\/containers\/Bundle\/Application\/3CF27778-1818-49E2-A6E3-D4C050D4D546\/WhatsApp.app\/WhatsApp",
+  "bundleInfo" : {"CFBundleShortVersionString":"26.24.72","CFBundleVersion":"999852572","CFBundleIdentifier":"net.whatsapp.WhatsAppSMB","DTAppStoreToolsBuild":"17F106"},
+  "storeInfo" : {"deviceIdentifierForVendor":"840F5E1E-92D1-4E8C-9A26-8D0DE83C81EE","thirdParty":true},
+  "parentProc" : "launchd",
+  "parentPid" : 1,
+  "coalitionName" : "net.whatsapp.WhatsAppSMB",
+  "crashReporterKey" : "29fc6f828798b3bbad42efe411745d781bf89fb6",
+  "appleIntelligenceStatus" : {"state":"available"},
+  "developerMode" : 1,
+  "bootProgressRegister" : "0x2000000c",
+  "wasUnlockedSinceBoot" : 1,
+  "isLocked" : 0,
+  "codeSigningID" : "net.whatsapp.WhatsAppSMB",
+  "codeSigningTeamID" : "C94RZ83GH5",
+  "codeSigningFlags" : 570434309,
+  "codeSigningValidationCategory" : 3,
+  "codeSigningTrustLevel" : 4,
+  "codeSigningAuxiliaryInfo" : 9007199254740992,
+  "instructionByteStream" : {"beforePC":"fyMD1f17v6n9AwCR0+3\/l78DAJH9e8Go\/w9f1sADX9YQKYDSARAA1A==","atPC":"AwEAVH8jA9X9e7+p\/QMAkcjt\/5e\/AwCR\/XvBqP8PX9bAA1\/WECeA0g=="},
+  "bootSessionUUID" : "753A5C27-7217-4475-B737-95D74E1638CD",
+  "basebandVersion" : "1.70.01",
+  "exception" : {"codes":"0x0000000000000000, 0x0000000000000000","rawCodes":[0,0],"type":"EXC_CRASH","signal":"SIGABRT"},
+  "termination" : {"flags":0,"code":6,"namespace":"SIGNAL","indicator":"Abort trap: 6","byProc":"WhatsApp","byPid":8646},
+  "asi" : {"libsystem_c.dylib":["abort() called"]},
+  "exceptionReason" : {"arguments":["__NSArrayM","array","0x122434330"],"format_string":"-[%s %s]: unrecognized selector sent to instance %p","name":"NSInvalidArgumentException","type":"objc-exception","composed_message":"-[__NSArrayM array]: unrecognized selector sent to instance 0x122434330","class":"NSException"},
+  "lastExceptionBacktrace" : [{"imageOffset":1135172,"symbol":"__exceptionPreprocess","symbolLocation":164,"imageIndex":8},{"imageOffset":201252,"symbol":"objc_exception_throw","symbolLocation":88,"imageIndex":7},{"imageOffset":1598128,"symbol":"-[NSObject(NSObject) __retain_OA]","symbolLocation":0,"imageIndex":8},{"imageOffset":406828,"symbol":"___forwarding___","symbolLocation":1472,"imageIndex":8},{"imageOffset":450144,"symbol":"_CF_forwarding_prep_0","symbolLocation":96,"imageIndex":8},{"imageOffset":15587704,"symbol":"XPluginsGetListLookupDataPair","symbolLocation":13367340,"imageIndex":0},{"imageOffset":30021220,"symbol":"XPluginsGetListLookupDataPair","symbolLocation":27800856,"imageIndex":0},{"imageOffset":19836,"symbol":"run_drive_inline","symbolLocation":988,"imageIndex":2},{"imageOffset":16976,"symbol":"waInit","symbolLocation":592,"imageIndex":2},{"imageOffset":404312,"symbol":"invocation function for block in dyld4::Loader::findAndRunAllInitializers(dyld4::RuntimeState&) const::$_0::operator()() const","symbolLocation":180,"imageIndex":9},{"imageOffset":130684,"symbol":"invocation function for block in dyld3::MachOAnalyzer::forEachInitializer(Diagnostics&, dyld3::MachOAnalyzer::VMAddrConverter const&, void (unsigned int) block_pointer, void const*) const","symbolLocation":320,"imageIndex":9},{"imageOffset":585124,"symbol":"invocation function for block in mach_o::UnsafeHeader::forEachSection(void (mach_o::UnsafeHeader::SectionInfo const&, bool&) block_pointer) const","symbolLocation":312,"imageIndex":9},{"imageOffset":571824,"symbol":"mach_o::UnsafeHeader::forEachLoadCommand(void (load_command const*, bool&) block_pointer) const","symbolLocation":208,"imageIndex":9},{"imageOffset":577796,"symbol":"mach_o::UnsafeHeader::forEachSection(void (mach_o::UnsafeHeader::SectionInfo const&, bool&) block_pointer) const","symbolLocation":124,"imageIndex":9},{"imageOffset":132560,"symbol":"dyld3::MachOAnalyzer::forEachInitializer(Diagnostics&, dyld3::MachOAnalyzer::VMAddrConverter const&, void (unsigned int) block_pointer, void const*) const","symbolLocation":516,"imageIndex":9},{"imageOffset":133260,"symbol":"dyld4::Loader::findAndRunAllInitializers(dyld4::RuntimeState&) const","symbolLocation":528,"imageIndex":9},{"imageOffset":138176,"symbol":"dyld4::PrebuiltLoader::runInitializers(dyld4::RuntimeState&) const","symbolLocation":44,"imageIndex":9},{"imageOffset":393684,"symbol":"dyld4::Loader::runInitializersBottomUp(dyld4::RuntimeState&, lsl::Vector<AuthenticatedValue<dyld4::Loader const*>>&, lsl::Vector<AuthenticatedValue<dyld4::Loader const*>>&) const","symbolLocation":568,"imageIndex":9},{"imageOffset":393416,"symbol":"dyld4::Loader::runInitializersBottomUp(dyld4::RuntimeState&, lsl::Vector<AuthenticatedValue<dyld4::Loader const*>>&, lsl::Vector<AuthenticatedValue<dyld4::Loader const*>>&) const","symbolLocation":300,"imageIndex":9},{"imageOffset":140664,"symbol":"dyld4::Loader::runInitializersBottomUpPlusUpwardLinks(dyld4::RuntimeState&) const::$_0::operator()() const","symbolLocation":116,"imageIndex":9},{"imageOffset":140464,"symbol":"dyld4::Loader::runInitializersBottomUpPlusUpwardLinks(dyld4::RuntimeState&) const","symbolLocation":716,"imageIndex":9},{"imageOffset":326044,"symbol":"dyld4::prepare(dyld4::APIs&, mach_o::UnsafeHeader const*)","symbolLocation":4036,"imageIndex":9},{"imageOffset":321980,"symbol":"dyld4::start(dyld4::KernelArgs*, void*, void*, unsigned long long)::$_1::operator()() const","symbolLocation":320,"imageIndex":9},{"imageOffset":19396,"symbol":"start","symbolLocation":6840,"imageIndex":9}],
+  "faultingThread" : 0,
+  "threads" : [{"triggered":true,"id":3460294,"threadState":{"x":[{"value":0},{"value":0},{"value":0},{"value":0},{"value":6557506771},{"value":6138267520},{"value":110},{"value":18446726483670988800},{"value":17090947631643736770},{"value":17090947625444154114},{"value":2},{"value":4294967293},{"value":0},{"value":0},{"value":0},{"value":0},{"value":328},{"value":8380883392,"symbolLocation":0,"symbol":"_main_thread"},{"value":0},{"value":6},{"value":259},{"value":8380883616,"symbolLocation":224,"symbol":"_main_thread"},{"value":8329920512,"symbolLocation":0,"symbol":"OBJC_IVAR_$_Object.isa"},{"value":1},{"value":1},{"value":104},{"value":6138271824},{"value":8380824624,"symbolLocation":0,"symbol":"objc_debug_tag60_permutations"},{"value":16}],"flavor":"ARM_THREAD_STATE64","lr":{"value":8215123932},"cpsr":{"value":1073741824},"fp":{"value":6138267376},"sp":{"value":6138267344},"esr":{"value":1442840704,"description":"(Syscall)"},"pc":{"value":9557803472,"matchesCrashFrame":1},"far":{"value":0}},"queue":"com.apple.main-thread","frames":[{"imageOffset":45520,"symbol":"__pthread_kill","symbolLocation":8,"imageIndex":3},{"imageOffset":30684,"symbol":"pthread_kill","symbolLocation":268,"imageIndex":4},{"imageOffset":487372,"symbol":"abort","symbolLocation":148,"imageIndex":5},{"imageOffset":32724,"symbol":"__abort_message","symbolLocation":132,"imageIndex":6},{"imageOffset":39824,"symbol":"demangling_terminate_handler()","symbolLocation":296,"imageIndex":6},{"imageOffset":211048,"symbol":"_objc_terminate()","symbolLocation":156,"imageIndex":7},{"imageOffset":82424,"symbol":"std::__terminate(void (*)())","symbolLocation":16,"imageIndex":6},{"imageOffset":89624,"symbol":"__cxxabiv1::failed_throw(__cxxabiv1::__cxa_exception*)","symbolLocation":88,"imageIndex":6},{"imageOffset":9056,"symbol":"__cxa_throw","symbolLocation":92,"imageIndex":6},{"imageOffset":201612,"symbol":"objc_exception_throw","symbolLocation":448,"imageIndex":7},{"imageOffset":1598128,"symbol":"-[NSObject(NSObject) doesNotRecognizeSelector:]","symbolLocation":384,"imageIndex":8},{"imageOffset":406828,"symbol":"___forwarding___","symbolLocation":1472,"imageIndex":8},{"imageOffset":450144,"symbol":"_CF_forwarding_prep_0","symbolLocation":96,"imageIndex":8},{"imageOffset":15587704,"symbol":"XPluginsGetListLookupDataPair","symbolLocation":13367340,"imageIndex":0},{"imageOffset":30021220,"symbol":"XPluginsGetListLookupDataPair","symbolLocation":27800856,"imageIndex":0},{"imageOffset":19836,"symbol":"run_drive_inline","symbolLocation":988,"imageIndex":2},{"imageOffset":16976,"symbol":"waInit","symbolLocation":592,"imageIndex":2},{"imageOffset":404312,"symbol":"invocation function for block in dyld4::Loader::findAndRunAllInitializers(dyld4::RuntimeState&) const::$_0::operator()() const","symbolLocation":180,"imageIndex":9},{"imageOffset":130684,"symbol":"invocation function for block in dyld3::MachOAnalyzer::forEachInitializer(Diagnostics&, dyld3::MachOAnalyzer::VMAddrConverter const&, void (unsigned int) block_pointer, void const*) const","symbolLocation":320,"imageIndex":9},{"imageOffset":585124,"symbol":"invocation function for block in mach_o::UnsafeHeader::forEachSection(void (mach_o::UnsafeHeader::SectionInfo const&, bool&) block_pointer) const","symbolLocation":312,"imageIndex":9},{"imageOffset":571824,"symbol":"mach_o::UnsafeHeader::forEachLoadCommand(void (load_command const*, bool&) block_pointer) const","symbolLocation":208,"imageIndex":9},{"imageOffset":577796,"symbol":"mach_o::UnsafeHeader::forEachSection(void (mach_o::UnsafeHeader::SectionInfo const&, bool&) block_pointer) const","symbolLocation":124,"imageIndex":9},{"imageOffset":132560,"symbol":"dyld3::MachOAnalyzer::forEachInitializer(Diagnostics&, dyld3::MachOAnalyzer::VMAddrConverter const&, void (unsigned int) block_pointer, void const*) const","symbolLocation":516,"imageIndex":9},{"imageOffset":133260,"symbol":"dyld4::Loader::findAndRunAllInitializers(dyld4::RuntimeState&) const","symbolLocation":528,"imageIndex":9},{"imageOffset":138176,"symbol":"dyld4::PrebuiltLoader::runInitializers(dyld4::RuntimeState&) const","symbolLocation":44,"imageIndex":9},{"imageOffset":393684,"symbol":"dyld4::Loader::runInitializersBottomUp(dyld4::RuntimeState&, lsl::Vector<AuthenticatedValue<dyld4::Loader const*>>&, lsl::Vector<AuthenticatedValue<dyld4::Loader const*>>&) const","symbolLocation":568,"imageIndex":9},{"imageOffset":393416,"symbol":"dyld4::Loader::runInitializersBottomUp(dyld4::RuntimeState&, lsl::Vector<AuthenticatedValue<dyld4::Loader const*>>&, lsl::Vector<AuthenticatedValue<dyld4::Loader const*>>&) const","symbolLocation":300,"imageIndex":9},{"imageOffset":140664,"symbol":"dyld4::Loader::runInitializersBottomUpPlusUpwardLinks(dyld4::RuntimeState&) const::$_0::operator()() const","symbolLocation":116,"imageIndex":9},{"imageOffset":140464,"symbol":"dyld4::Loader::runInitializersBottomUpPlusUpwardLinks(dyld4::RuntimeState&) const","symbolLocation":716,"imageIndex":9},{"imageOffset":326044,"symbol":"dyld4::prepare(dyld4::APIs&, mach_o::UnsafeHeader const*)","symbolLocation":4036,"imageIndex":9},{"imageOffset":321980,"symbol":"dyld4::start(dyld4::KernelArgs*, void*, void*, unsigned long long)::$_1::operator()() const","symbolLocation":320,"imageIndex":9},{"imageOffset":19396,"symbol":"start","symbolLocation":6840,"imageIndex":9}]}],
+  "usedImages" : [
+  {
+    "source" : "P",
+    "arch" : "arm64",
+    "base" : 4328570880,
+    "size" : 114147328,
+    "uuid" : "4c4c446e-5555-3144-a192-5e8e0fb8d4cf",
+    "path" : "\/private\/var\/containers\/Bundle\/Application\/3CF27778-1818-49E2-A6E3-D4C050D4D546\/WhatsApp.app\/WhatsApp",
+    "name" : "WhatsApp"
+  },
+  {
+    "source" : "P",
+    "arch" : "arm64",
+    "base" : 4493918208,
+    "size" : 53477376,
+    "uuid" : "4c4c448d-5555-3144-a12c-b78309b74018",
+    "path" : "\/private\/var\/containers\/Bundle\/Application\/3CF27778-1818-49E2-A6E3-D4C050D4D546\/WhatsApp.app\/Frameworks\/SharedModules.framework\/SharedModules",
+    "name" : "SharedModules"
+  },
+  {
+    "source" : "P",
+    "arch" : "arm64",
+    "base" : 4480139264,
+    "size" : 32768,
+    "uuid" : "af23e80b-3202-3c59-bfc4-ed62047c0630",
+    "path" : "\/private\/var\/containers\/Bundle\/Application\/3CF27778-1818-49E2-A6E3-D4C050D4D546\/WhatsApp.app\/Frameworks\/libwaContainerFix.dylib",
+    "name" : "libwaContainerFix.dylib"
+  },
+  {
+    "source" : "P",
+    "arch" : "arm64e",
+    "base" : 9557757952,
+    "size" : 244512,
+    "uuid" : "a11bf433-17ab-3f01-88bc-54c467ce6287",
+    "path" : "\/usr\/lib\/system\/libsystem_kernel.dylib",
+    "name" : "libsystem_kernel.dylib"
+  },
+  {
+    "source" : "P",
+    "arch" : "arm64e",
+    "base" : 8215093248,
+    "size" : 50416,
+    "uuid" : "46b95807-f752-3dc2-a1ba-6290e8d7fe38",
+    "path" : "\/usr\/lib\/system\/libsystem_pthread.dylib",
+    "name" : "libsystem_pthread.dylib"
+  },
+  {
+    "source" : "P",
+    "arch" : "arm64e",
+    "base" : 6807633920,
+    "size" : 521728,
+    "uuid" : "ca7f1aef-8c1f-33a2-b1cc-52d9ab644bea",
+    "path" : "\/usr\/lib\/system\/libsystem_c.dylib",
+    "name" : "libsystem_c.dylib"
+  },
+  {
+    "source" : "P",
+    "arch" : "arm64e",
+    "base" : 6557413376,
+    "size" : 107936,
+    "uuid" : "10fb000e-5edb-3a04-996b-be734107cf07",
+    "path" : "\/usr\/lib\/libc++abi.dylib",
+    "name" : "libc++abi.dylib"
+  },
+  {
+    "source" : "P",
+    "arch" : "arm64e",
+    "base" : 6556188672,
+    "size" : 332928,
+    "uuid" : "a4d0da7a-2f8f-3d26-9953-218851547bfc",
+    "path" : "\/usr\/lib\/libobjc.A.dylib",
+    "name" : "libobjc.A.dylib"
+  },
+  {
+    "source" : "P",
+    "arch" : "arm64e",
+    "base" : 6611038208,
+    "size" : 5884352,
+    "uuid" : "5565cad9-4941-32ac-8b10-7d3233c74151",
+    "path" : "\/System\/Library\/Frameworks\/CoreFoundation.framework\/CoreFoundation",
+    "name" : "CoreFoundation"
+  },
+  {
+    "source" : "P",
+    "arch" : "arm64e",
+    "base" : 6556733440,
+    "size" : 676992,
+    "uuid" : "0ba28ce2-8718-3cb3-bef4-6dd44464ebe2",
+    "path" : "\/usr\/lib\/dyld",
+    "name" : "dyld"
+  },
+  {
+    "size" : 0,
+    "source" : "A",
+    "base" : 0,
+    "uuid" : "00000000-0000-0000-0000-000000000000"
+  }
+],
+  "sharedCache" : {
+  "base" : 6555566080,
+  "size" : 5415927808,
+  "uuid" : "eb819a3a-3960-3eb2-97db-bc619885df55"
+},
+  "vmSummary" : "ReadOnly portion of Libraries: Total=2.2G resident=0K(0%) swapped_out_or_unallocated=2.2G(100%)\nWritable regions: Total=90.2M written=481K(1%) resident=481K(1%) swapped_out=0K(0%) unallocated=89.7M(99%)\n\n                                VIRTUAL   REGION \nREGION TYPE                        SIZE    COUNT (non-coalesced) \n===========                     =======  ======= \nActivity Tracing                   256K        1 \nKernel Alloc Once                   32K        1 \nMALLOC                            16.7M        9 \nMALLOC guard page                 3408K        4 \nMemory Tag 22                     64.0M        1 \nSTACK GUARD                         16K        1 \nStack                             1008K        1 \nVM_ALLOCATE                         80K        2 \n__AUTH                            11.8M      947 \n__AUTH_CONST                     124.1M     1380 \n__CTF                               824        1 \n__DATA                            87.8M     1329 \n__DATA_CONST                      53.4M     1393 \n__DATA_DIRTY                      12.2M     1201 \n__FONT_DATA                        2352        1 \n__LINKEDIT                       190.9M        4 \n__OBJC_RO                         85.2M        1 \n__OBJC_RW                         3211K        1 \n__TEXT                             2.0G     1410 \n__TPRO_CONST                       128K        2 \nmapped file                       9808K        2 \npage table in kernel               481K        1 \nshared memory                       48K        2 \n===========                     =======  ======= \nTOTAL                              2.6G     7695 \n",
+  "legacyInfo" : {
+  "threadTriggered" : {
+    "queue" : "com.apple.main-thread"
+  }
+},
+  "logWritingSignature" : "dc0746c5be507d7343537b1362c899c64185d1b7",
+  "bug_type" : "309",
+  "roots_installed" : 0,
+  "trmStatus" : 1,
+  "sandboxProfileName" : "container",
+  "trialInfo" : {
+  "rollouts" : [
+    {
+      "rolloutId" : "68fbde36f576351f1378c5d5",
+      "factorPackIds" : [
+        "68fbde79fac6f845b7757adf"
+      ],
+      "deploymentId" : 240000004
+    },
+    {
+      "rolloutId" : "6425c75e4327780c10cc4252",
+      "factorPackIds" : [
+        "642600a457e7664b1698eb32"
+      ],
+      "deploymentId" : 240000004
+    }
+  ],
+  "experiments" : [
+    {
+      "treatmentId" : "b94e9aec-71bd-46f0-b53b-72fe0d8e9aa4",
+      "experimentId" : "67e32776f470dc0e83d9e147",
+      "deploymentId" : 400000014
+    },
+    {
+      "treatmentId" : "d5c127b8-b13e-42a1-acf5-c483124a1bb5",
+      "experimentId" : "66b1602abe27b2208fd291ba",
+      "deploymentId" : 400000022
+    }
+  ]
+}
+}
