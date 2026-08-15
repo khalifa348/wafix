@@ -88,13 +88,39 @@ static Class wa_find_class(SEL sel) {
 
 static int g_hooked = 0;
 
-// real instance from the app's own global (the method loads x20 from this exact slot)
+// real instance: try class singleton accessors first, then the app's own global slot
 static id wa_real_instance(Class want) {
+    // 1) scan class methods for shared-instance accessors
+    if (want) {
+        unsigned int mc = 0;
+        Method *ml = class_copyMethodList(object_getClass(want), &mc);
+        for (unsigned int i = 0; i < mc; i++) {
+            SEL s = method_getName(ml[i]);
+            const char *n = sel_getName(s);
+            if (strstr(n, "shared") || strstr(n, "Shared") || strstr(n, "instance") || strstr(n, "Instance") || strstr(n, "manager") || strstr(n, "Manager")) {
+                id obj = ((id(*)(id, SEL))objc_msgSend)((id)want, s);
+                if (obj && object_isClass(obj) == NO && [obj isKindOfClass:want]) {
+                    wa_marker([NSString stringWithFormat:@"[inst] singleton via +%s", n]);
+                    free(ml);
+                    return obj;
+                }
+            }
+        }
+        free(ml);
+        wa_marker(@"[inst] no class-method singleton found — trying app global");
+    }
+    // 2) app's own global slot (the method itself loads x20 from this address)
     __unsafe_unretained id *slot = (__unsafe_unretained id *)g_slide_addr(kSingletonVMA);
     if (!slot) return nil;
     id obj = *slot;
     if (obj && want && object_isClass(obj) == NO && [obj isKindOfClass:want]) return obj;
-    return nil; // NOT of the wanted class (global slot may hold unrelated obj) -> zeroed fallback
+    if (obj && object_isClass(obj) == NO) {
+        // not the manager class, but v3 proved the method runs to the crash site
+        // with this receiver (it is the object the method itself messages)
+        wa_marker([NSString stringWithFormat:@"[inst] app global is %@ — using it (v3-proven path)", NSStringFromClass([obj class])]);
+        return obj;
+    }
+    return nil; // -> zeroed fallback (will crash in our harness — avoid by not calling)
 }
 
 static void run_drive_inline(void) {
@@ -113,22 +139,17 @@ static void run_drive_inline(void) {
     if (!c1) c1 = wa_find_class(s1);
     if (!c2) c2 = wa_find_class(s2);
 
-    // REAL instance from the app's own global slot
     id realSelf = wa_real_instance(c1 ?: c2);
-    wa_marker([NSString stringWithFormat:@"[drive] singleton global @%p -> %@ (%@)",
-               g_slide_addr(kSingletonVMA), realSelf ? NSStringFromClass([realSelf class]) : @"nil",
-               realSelf ? @"REAL" : @"missing — will use zeroed fallback"]);
+    wa_marker([NSString stringWithFormat:@"[drive] receiver: %@ (%@)",
+               realSelf ? NSStringFromClass([realSelf class]) : @"nil",
+               realSelf ? @"REAL" : @"NO REAL INSTANCE — skipping calls"]);
 
+    if (!realSelf) {
+        wa_marker(@"[drive] ABORT: no real instance — zeroed calloc instance crashes in OUR harness (objc_retain isa=NULL), useless evidence");
+        return;
+    }
     id self1 = realSelf;
     id self2 = realSelf;
-    if (!self1 && c1) {
-        self1 = (__bridge id)calloc(1, class_getInstanceSize(c1)); // zeroed — no garbage C++ ivars
-        wa_marker(@"[drive] using ZEROED fallback instance for method1");
-    }
-    if (!self2 && c2) {
-        self2 = (__bridge id)calloc(1, class_getInstanceSize(c2));
-        wa_marker(@"[drive] using ZEROED fallback instance for method2");
-    }
 
     // SITE 2 FIRST — v4: prove fetchLinkedAndPendingRemoval... (0x101CA1634) before
     // site 1 so a site-1 crash can't mask it.
@@ -154,7 +175,7 @@ static void run_drive_inline(void) {
 __attribute__((constructor))
 static void waInit(void) {
     @autoreleasepool {
-        wa_marker(@"=== waContainerFix ME73b v4 (t8 companion-device family, site2-first) constructor ===");
+        wa_marker(@"=== waContainerFix ME73b v5 (t8 family, site2-first, real-instance only) constructor ===");
 
         SEL s1 = NSSelectorFromString(@"fetchPendingRemovalCompanionDevicesForAccountUserJID:");
         SEL s2 = NSSelectorFromString(@"fetchLinkedAndPendingRemovalCompanionDevicesForAccountUserJID:currentDeviceList:");
