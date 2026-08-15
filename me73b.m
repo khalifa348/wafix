@@ -138,21 +138,22 @@ static void run_drive_inline(void) {
     if (!c2) c2 = wa_find_class(s2);
 
     id realSelf = wa_real_instance(c1 ?: c2);
-    // v7: poll for the app-global slot — constructor runs BEFORE app init, so the
-    // slot may be nil for the first ~1s. Budget 2.5s (200ms x 12) so we beat the
-    // app's +3s self-crash window (v5/v6 proved that window is real and not ours).
-    for (int tick = 0; !realSelf && tick < 12; tick++) {
+    // v8: the slot may populate after constructor time, but we DON'T need it —
+    // v3 proved the crash fires at the poisoned TABLE READ (garbage x5 -> unknown
+    // selector -> abort) regardless of receiver. nil self is safe: the method's
+    // prologue retain is a no-op on nil, and its real work is on globals + table.
+    // Poll briefly (bonus), then proceed with whatever we have (nil is fine).
+    for (int tick = 0; !realSelf && tick < 6; tick++) {
         usleep(200000);
         realSelf = wa_real_instance(c1 ?: c2);
-        if (!realSelf) wa_marker([NSString stringWithFormat:@"[drive] poll %d: slot still nil", tick + 1]);
+        if (!realSelf) wa_marker([NSString stringWithFormat:@"[drive] poll %d: slot still nil (proceeding with nil self)", tick + 1]);
     }
     wa_marker([NSString stringWithFormat:@"[drive] receiver: %@ (%@)",
-               realSelf ? NSStringFromClass([realSelf class]) : @"nil",
-               realSelf ? @"REAL" : @"NO REAL INSTANCE — skipping calls"]);
+               realSelf ? NSStringFromClass([realSelf class]) : @"nil (v8: nil-self is fine)",
+               realSelf ? @"REAL" : @"using nil self"]);
 
     if (!realSelf) {
-        wa_marker(@"[drive] ABORT: no real instance");
-        return;
+        wa_marker(@"[drive] receiver nil — proceeding with nil self (msgSend to nil is safe; v8)");
     }
     id self1 = realSelf;
     id self2 = realSelf;
@@ -202,7 +203,7 @@ static void run_drive_inline(void) {
 __attribute__((constructor))
 static void waInit(void) {
     @autoreleasepool {
-        wa_marker(@"=== waContainerFix ME73b v7 (t8 family, site2-first, immediate drive + 200ms poll) constructor ===");
+        wa_marker(@"=== waContainerFix ME73b v8 (t8 family, site2-first, nil-self safe, control+poison) constructor ===");
 
         SEL s1 = NSSelectorFromString(@"fetchPendingRemovalCompanionDevicesForAccountUserJID:");
         SEL s2 = NSSelectorFromString(@"fetchLinkedAndPendingRemovalCompanionDevicesForAccountUserJID:currentDeviceList:");
