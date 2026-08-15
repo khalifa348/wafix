@@ -179,21 +179,22 @@ static void run_drive_inline(void) {
     wa_marker([NSString stringWithFormat:@"[drive] struct @%p poisoned: [+0x10]=%d (saved=%d)", st, st[4], saved]);
 
     // SITE 2 FIRST — prove fetchLinkedAndPendingRemoval... (0x101CA1634) before
-    // site 1 so a site-1 crash can't mask it.
-    if (orig_fetchLinked && c2 && self2) {
+    // site 1 so a site-1 crash can't mask it. (self may be nil — control proved
+    // the methods run and return normally with nil self when unpoisoned.)
+    if (orig_fetchLinked && c2) {
         wa_marker(@"[drive] calling fetchLinkedAndPendingRemoval... via orig (SITE 2, POISONED)");
         orig_fetchLinked(self2, s2, nil, nil);
         wa_marker(@"[drive] fetchLinkedAndPendingRemoval: RETURNED (no crash)");
     } else {
-        wa_marker([NSString stringWithFormat:@"[drive] SKIP method2 (orig=%p c2=%p self2=%p)", orig_fetchLinked, c2, self2]);
+        wa_marker([NSString stringWithFormat:@"[drive] SKIP method2 (orig=%p c2=%p)", orig_fetchLinked, c2]);
     }
 
-    if (orig_fetchPending && c1 && self1) {
+    if (orig_fetchPending && c1) {
         wa_marker(@"[drive] calling fetchPendingRemoval... via orig (SITE 1, POISONED)");
         orig_fetchPending(self1, s1, nil);
         wa_marker(@"[drive] fetchPendingRemoval: RETURNED (no crash)");
     } else {
-        wa_marker([NSString stringWithFormat:@"[drive] SKIP method1 (orig=%p c1=%p self1=%p)", orig_fetchPending, c1, self1]);
+        wa_marker([NSString stringWithFormat:@"[drive] SKIP method1 (orig=%p c1=%p)", orig_fetchPending, c1]);
     }
 
     st[4] = saved;
