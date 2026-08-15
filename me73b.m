@@ -138,22 +138,24 @@ static void run_drive_inline(void) {
     if (!c2) c2 = wa_find_class(s2);
 
     id realSelf = wa_real_instance(c1 ?: c2);
-    // v8: the slot may populate after constructor time, but we DON'T need it —
-    // v3 proved the crash fires at the poisoned TABLE READ (garbage x5 -> unknown
-    // selector -> abort) regardless of receiver. nil self is safe: the method's
-    // prologue retain is a no-op on nil, and its real work is on globals + table.
-    // Poll briefly (bonus), then proceed with whatever we have (nil is fine).
-    for (int tick = 0; !realSelf && tick < 6; tick++) {
+    // v9: the table base IS the app-global slot (site 2: adrp/ldr x19,[0x107ceb520];
+    // x20 table derives from it). v3 proved the slot holds a REAL NSMutableArray at
+    // constructor time on some launches; v4-v8 hit nil-slot launches where driving
+    // produces only a nil-table artifact (132741: fault 0x28 = idx0 with x20=0).
+    // Poll up to 2.8s for a populated slot; if it never appears, exit cleanly (dud
+    // run) — do NOT call with nil self (that yields a non-signature crash).
+    for (int tick = 0; !realSelf && tick < 14; tick++) {
         usleep(200000);
         realSelf = wa_real_instance(c1 ?: c2);
-        if (!realSelf) wa_marker([NSString stringWithFormat:@"[drive] poll %d: slot still nil (proceeding with nil self)", tick + 1]);
+        if (!realSelf) wa_marker([NSString stringWithFormat:@"[drive] poll %d: slot still nil", tick + 1]);
     }
     wa_marker([NSString stringWithFormat:@"[drive] receiver: %@ (%@)",
-               realSelf ? NSStringFromClass([realSelf class]) : @"nil (v8: nil-self is fine)",
-               realSelf ? @"REAL" : @"using nil self"]);
+               realSelf ? NSStringFromClass([realSelf class]) : @"nil",
+               realSelf ? @"REAL" : @"NO REAL SLOT — DUD RUN, no calls"]);
 
     if (!realSelf) {
-        wa_marker(@"[drive] receiver nil — proceeding with nil self (msgSend to nil is safe; v8)");
+        wa_marker(@"[drive] DUD: slot never populated in 2.8s — clean exit (app-self +3s crash will produce the .ips)");
+        return;
     }
     id self1 = realSelf;
     id self2 = realSelf;
@@ -204,7 +206,7 @@ static void run_drive_inline(void) {
 __attribute__((constructor))
 static void waInit(void) {
     @autoreleasepool {
-        wa_marker(@"=== waContainerFix ME73b v8 (t8 family, site2-first, nil-self safe, control+poison) constructor ===");
+        wa_marker(@"=== waContainerFix ME73b v9 (t8 family, site2-first, poll-for-real-slot, control+poison) constructor ===");
 
         SEL s1 = NSSelectorFromString(@"fetchPendingRemovalCompanionDevicesForAccountUserJID:");
         SEL s2 = NSSelectorFromString(@"fetchLinkedAndPendingRemovalCompanionDevicesForAccountUserJID:currentDeviceList:");
