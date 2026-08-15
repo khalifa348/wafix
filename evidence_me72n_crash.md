@@ -48,3 +48,18 @@ Two IDENTICAL crash reports (deterministic), 3s after launch, faulting thread = 
 - marker: wafix_marker_me72n.txt (stops at "lead1: calling orig with crafted mergeCompletion (idx=100)...")
 - device container: FBB42998-8968-4870-A477-0942CEEFF353
 - source: wafix/me72.m (ME72n commit, pushed)
+
+## REGISTER-STATE PROOF (from .ips threadState)
+Faulting thread 0 registers at crash (WhatsApp slide = 0x473c000):
+- x16 = 0x64 (100)  <- crafted idx (completion struct +0)
+- x12 = 0x65 (101), x13 = 0x66 (102)  <- adjacent crafted fields
+- x20 = x0 = 0x10e9e7e20  <- the crafted completion struct (arg5 nseMergeCompletion:)
+- x24 = 0x10fd94000      <- table base indexed by the crafted value
+- lr  = 0x104ac5b80 -> static 0x100389b80 (crashing function, matches disasm)
+- pc  = 0x19bcc944c = libobjc base 0x19bcc8000 + 0x144c = objc_retain
+- WhatsApp base 0x10473c000, libwaContainerFix base 0x10d7e4000
+The drive's planted values were IN THE CPU REGISTERS at the moment of the fault:
+WhatsApp's code consumed completion-struct+0 = 100 as a table index (x24+x8*8),
+loaded a garbage object pointer, then objc_retain'd it -> SIGSEGV @ 0x80.
+Differential: OLD 26.22.76 same drive = guard caught, RETURNED safe.
+             NEW 26.24.72 same drive = NO guard, SIGSEGV. (regression confirmed)
