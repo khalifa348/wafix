@@ -1,0 +1,146 @@
+====================================================================
+QA VERDICT — Table-Indexing Robustness Audit
+Binary: WhatsApp.app/WhatsApp (test build 26.24.72, arm64, image base 0x100000000)
+Routine: helper reached from didOfflineResumeStartWithType:totalStanzasCount:
+          on WAMessageBatchingConfigurator (server-supplied offline-resume
+          stanza count)
+Disassembled range: 0x100337b88 - 0x100337c10
+Method: static disassembly (capstone, byte-exact verified against the file),
+        cross-checked against the on-device proof already captured for this
+        site (crafted count = 0x7FFFFFFF -> confirmed SIGSEGV).
+====================================================================
+
+1) TABLE BASE REGISTER AND ELEMENT SIZE
+----------------------------------------
+Table base register: x21
+Element size: 8 bytes (pointer-sized)
+
+Evidence — x21 is used as the base for three sibling loads in the same
+block, all into 64-bit (x-form) destination registers:
+  0x100337bb8   ldr  x23, [x21, x9]
+  0x100337bcc   ldr  x25, [x21, x8]   <- the load that faults
+  0x100337bd0   ldr  x21, [x21, x10]
+All three destinations are 8-byte GPRs, confirming pointer-sized (8-byte)
+elements/slots in whatever structure x21 addresses.
+
+2) HOW THE INPUT COUNT BECOMES THE INDEX
+------------------------------------------
+Exact instruction sequence at the crash site (byte-verified):
+  0x100337bc8:  081180b9   ldrsw x8, [x8, #0x10]   ; sign-extend load, count field
+  0x100337bcc:  b96a68f8   ldr   x25, [x21, x8]    ; table read at base+offset
+
+- `ldrsw x8, [x8, #0x10]` loads a 32-bit signed value from offset +0x10 of a
+  struct/context pointer (x8) and sign-extends it to 64 bits. This is the
+  field that carries the server-supplied count (directly or via a value
+  derived from totalStanzasCount upstream in the async continuation).
+- CRITICAL FINDING: the subsequent `ldr x25, [x21, x8]` uses x8 as a
+  **register-offset with NO shift** (capstone confirms shift.type=0,
+  shift.value=0 on both instructions). There is no `lsl #3` and no explicit
+  `mul`/`add x, x, x, lsl #3` anywhere between the load and the dereference.
+  This means the value taken from the count field is used **directly as a
+  raw byte offset** from x21, NOT as an "index" that gets multiplied by an
+  8-byte stride at this site. Any scaling (if it happens at all) must occur
+  BEFORE this field is populated, outside the disassembled window — this
+  routine does no scaling of its own and applies zero validation.
+- Net effect: the relationship between the server-controlled count and the
+  memory address actually read is effectively 1:1 (or at most a small fixed
+  multiple established elsewhere) with **no independent bounds check in this
+  code path.**
+
+3) BOUNDS-CHECK AUDIT (largest safe / smallest unsafe count)
+---------------------------------------------------------------
+Scanned the full instruction stream from 0x100337b48 through 0x100337bd0
+(function entry region through the fault site) for any bounds-check pattern
+(cmp/cmn/tst/ccmp/csel/b.hi/b.hs/b.lo/b.ls/tbz/tbnz/cbz/cbnz against a
+length/capacity value): **NONE found that gates the count field before use.**
+The only conditional branches present (`cbnz x21, ...`, `cmp x21, #1/#2`)
+test an unrelated pointer/state register (x21 is reused for multiple
+purposes across the function — a null/state check earlier, then reloaded
+as the table base by the time execution reaches 0x100337bb8). None of them
+constrain the value loaded from struct+0x10 before it is used as an offset.
+
+Consequence for "largest count that stays in-bounds vs. smallest that goes
+out of bounds": because there is **zero validation code** anywhere in this
+path, the in-bounds/out-of-bounds boundary is determined entirely by the
+(small, fixed, compile-time) size of whatever heap block backs x21 at
+runtime — a property NOT encoded in this instruction sequence and not
+recoverable from static disassembly of this 0x88-byte window alone. What
+IS conclusively established:
+  - The crash is **proven on-device** with count = 0x7FFFFFFF (2,147,483,647):
+    x21 + 0x7FFFFFFF walks ~2 GB past the table base -> guaranteed unmapped
+    page -> SIGSEGV at exactly this instruction pair.
+  - Because there is no clamp, no modulo, and no length compare, **every**
+    count value large enough to walk past the real (almost certainly small —
+    likely a handful of pointer-slots for a fixed dispatch/lookup table) heap
+    allocation behind x21 will fault the same way. Given typical allocation
+    sizes for this class of fixed-shape dispatch table (single-digit to low
+    tens of 8-byte slots, i.e. well under a few hundred bytes), the safe
+    ceiling is almost certainly in the "tens" range, not thousands — but
+    pinning the *exact* last-safe integer requires one dynamic run per
+    candidate value (see recommended test matrix below) since the backing
+    allocation's size is set up outside the audited window.
+
+4) REALISTIC SERVER VALUES (0–200,000): SAFETY ASSESSMENT
+--------------------------------------------------------------
+- 0: Likely safe in isolation (offset 0 reads the first slot) — but even
+  this is unverified by any guard in this code; it is "safe" only by luck
+  of a small positive base offset, not by design.
+- Small counts matching genuine legitimate resume-batch sizes (roughly
+  single digits to a few dozen, whatever the app's real max designed batch
+  size is): probably in-bounds, again only incidentally — not because the
+  code validates them.
+- Any count from roughly the hundreds upward: increasingly likely to run
+  past the true backing allocation and fault or, worse, read attacker/
+  environment-influenced adjacent heap memory (info-leak risk) if it lands
+  on a mapped-but-wrong page instead of an unmapped one.
+- 1,000 / 10,000 / 100,000 / 200,000: MUST BE TREATED AS UNSAFE UNTIL
+  PROVEN OTHERWISE. There is no code-level reason any of these values would
+  be rejected or clamped — they are exactly the same code path, with no
+  additional gate, that is already proven to crash at 0x7FFFFFFF. The whole
+  0–200,000 server-facing range is therefore **unvalidated input reaching a
+  raw pointer-arithmetic dereference**, and must be assumed exploitable for
+  denial-of-service (crash) and possibly out-of-bounds read/info-disclosure
+  (if an offset happens to land on mapped memory) until a real bounds check
+  is added and verified.
+
+====================================================================
+QA VERDICT — SHIP-BLOCKING FINDING
+====================================================================
+FAIL — do not ship without remediation.
+
+- The count parameter delivered via
+  didOfflineResumeStartWithType:totalStanzasCount: (server/XMPP-controlled,
+  offline message-resume count) reaches a pointer-table dereference
+  (table base x21, ldr x25 at 0x100337bcc) with:
+    (a) no upper-bound / capacity check,
+    (b) no clamping or modulo,
+    (c) the raw signed 32-bit value used essentially directly as a byte
+        offset from the table base (ldrsw + unshifted register-offset
+        addressing).
+- Already proven on-device: count = 0x7FFFFFFF -> SIGSEGV at this exact
+  instruction pair.
+- By the same unguarded code path, there is no basis to consider ANY value
+  in the realistic server range 0–200,000 "safe" — only small values near
+  the true (unknown from statics) legitimate table size are plausibly safe,
+  and that boundary is currently undefined and unenforced in code.
+
+REQUIRED FIX BEFORE RELEASE:
+1. Add an explicit range/capacity check on totalStanzasCount (or on
+   whatever intermediate field feeds struct+0x10) immediately after it is
+   received from the server and BEFORE it is stored into the field consumed
+   at 0x100337bc8 — reject or clamp to the actual number of valid table
+   entries.
+2. Do not rely on the field being "usually small in practice" — the
+   dispatch/table code applies zero defense-in-depth; a single malformed or
+   malicious server response can pass an arbitrarily large 32-bit count.
+3. RECOMMENDED QA TEST MATRIX (to empirically pin the exact last-safe /
+   first-unsafe integer on-device, since it depends on a runtime allocation
+   size not visible in this static window):
+     0, 1, 2, 5, 10, 20, 50, 100, 500, 1,000, 10,000, 50,000, 100,000,
+     200,000, 2,147,483,647 (already proven to crash).
+   Run each through the same swizzle/drive harness used for the proven
+   0x7FFFFFFF test and record first crash. Everything at or above that
+   threshold must be rejected by the fix in item 1; everything below it
+   should additionally get an explicit validated ceiling rather than being
+   "safe by accident."
+====================================================================
