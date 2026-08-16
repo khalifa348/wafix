@@ -379,6 +379,18 @@ static BOOL wa_hasMethodDirect(Class cls, SEL sel) {
     return found;
 }
 
+// v23: selectors that MUST NOT be synthesized. v20's blanket synthesis made
+// CoreAutoLayout's NSIS-internal protocol probes (nsli_*) respond YES; the
+// layout engine then CALLED our no-op, got nil, and threw "no common
+// ancestor" in -[NSLayoutConstraint _setActive:] (crash 161954/162457).
+// These are NOT in the app binary — stock NO lets the engine use its
+// fallback path. CoreUI's _dynamicContextEvaluation is likewise internal.
+static BOOL wa_blocklistedSelector(const char *name) {
+    if (strncmp(name, "nsli", 4) == 0) return YES;          // CoreAutoLayout NSIS protocol
+    if (strstr(name, "DynamicContext") != NULL) return YES; // CoreUI evaluation probe
+    return NO;
+}
+
 static BOOL wa_resolveInstance(id self, SEL _cmd, SEL name) {
     if (wa_resolvingInst) return NO;   // recursion guard (thread-local)
     Class cls = (Class)self;
@@ -386,15 +398,25 @@ static BOOL wa_resolveInstance(id self, SEL _cmd, SEL name) {
     const char *selName = sel_getName(name);
     // v9: os_log private path — stock behavior, instant NO, no log/marker churn
     if (wa_isOsLogSelector(selName)) return NO;
-    // v21: NO SYNTHESIS AT ALL — stock behavior. v20's universal no-op
-    // synthesis made UIKit/CoreAutoLayout internal probes (nsli_*,
-    // _dynamicContextEvaluation:, -displayLayer: etc.) return YES; the engine
-    // then CALLS the no-op, gets nil back, and throws "no common ancestor"
-    // in -[NSLayoutConstraint _setActive:] (crash 161954/162457). These
-    // probes are NOT in the app binary — stock NO is the correct answer.
-    // Marker file kept for diagnostics only.
-    wa_markerOnce([NSString stringWithFormat:@"RESOLVE-INST %s -%s (NO)", clsName, selName]);
-    return NO;
+    // v20: WhatsApp classes only — never synthesize for system classes
+    // (BaseBoard BSXPCCoder +initialize recursion trap, crash 161132)
+    if (!wa_isWhatsAppClass(cls)) return NO;
+    // v23: blocklist check (nsli_* autolayout internals, CoreUI probes)
+    if (wa_blocklistedSelector(selName)) return NO;
+    // v11: NO os_log here — os_log's encoding path can itself trigger
+    // class_respondsToSelector -> resolveMethod_locked -> re-entry (ME40
+    // crash stack showed exactly that). Marker file is our ground truth.
+    wa_markerOnce([NSString stringWithFormat:@"RESOLVE-INST %s -%s", clsName, selName]);
+    if (wa_hasRealForwardingDirect(cls)) {
+        return NO;
+    }
+    wa_resolvingInst = YES;
+    BOOL added = class_addMethod(cls, name, (IMP)wa_noop, "@@:");
+    wa_resolvingInst = NO;
+    if (!added && !wa_hasMethodDirect(cls, name)) {
+        return NO;
+    }
+    return YES;
 }
 
 static BOOL wa_resolveClass(id self, SEL _cmd, SEL name) {
@@ -404,9 +426,23 @@ static BOOL wa_resolveClass(id self, SEL _cmd, SEL name) {
     const char *selName = sel_getName(name);
     // v9: os_log private path — stock behavior, instant NO
     if (wa_isOsLogSelector(selName)) return NO;
-    // v21: NO SYNTHESIS (see wa_resolveInstance) — stock behavior only.
-    wa_markerOnce([NSString stringWithFormat:@"RESOLVE-CLASS %s +%s (NO)", clsName, selName]);
-    return NO;
+    // v20: WhatsApp classes only (class-method resolution runs on metaclasses;
+    // the metaclass image is the same as the class's)
+    if (!wa_isWhatsAppClass(meta)) return NO;
+    // v23: blocklist check
+    if (wa_blocklistedSelector(selName)) return NO;
+    // v11: NO os_log here (re-entry vector, see wa_resolveInstance)
+    wa_markerOnce([NSString stringWithFormat:@"RESOLVE-CLASS %s +%s", clsName, selName]);
+    if (wa_hasRealForwardingDirect(meta)) {
+        return NO;
+    }
+    wa_resolvingCls = YES;
+    BOOL added = class_addMethod(meta, name, (IMP)wa_noop, "@@:");
+    wa_resolvingCls = NO;
+    if (!added && !wa_hasMethodDirect(meta, name)) {
+        return NO;
+    }
+    return YES;
 }
 
 // ---------- v2: nil-guard +[NSURL fileURLWithPath:] ----------
@@ -715,8 +751,8 @@ static void wa_swizzle_inst(Class cls, SEL sel, IMP imp, IMP *origOut) {
 
 __attribute__((constructor))
 static void wa_init(void) {
-    os_log_info(wa_log(), "waContainerFix v22 constructor running");
-    wa_marker(@"=== waContainerFix v22 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v23 constructor running");
+    wa_marker(@"=== waContainerFix v23 constructor ===");
 
     // v10/v11: anti-tamper evasion — init dyld interpose reals FIRST so the
     // fakes are correct before any swizzle/launch activity
