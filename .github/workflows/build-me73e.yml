@@ -1,0 +1,20 @@
+name: build-me73e
+on:
+  push:
+    branches: [main]
+    paths: ['me73e.m', '.github/workflows/build-me73e.yml']
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile ME73e dylib
+        run: |
+          xcrun clang -arch arm64 -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
+            -fobjc-arc -dynamiclib -miphoneos-version-min=15.0 \
+            -o libwaContainerFix.dylib me73e.m \
+            -framework Foundation
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wafix-dylib
+          path: libwaContainerFix.dylib
