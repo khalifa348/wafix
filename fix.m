@@ -379,21 +379,16 @@ static BOOL wa_hasMethodDirect(Class cls, SEL sel) {
     return found;
 }
 
-// v24: selectors that MUST NOT be synthesized. v20's blanket synthesis made
-// CoreAutoLayout's NSIS-internal protocol probes (nsli_*) respond YES; the
-// layout engine then CALLED our no-op, got nil, and threw "no common
-// ancestor" in -[NSLayoutConstraint _setActive:] (crash 161954/162457).
-// v23's scene-connection abort (165815) repeated the pattern with UIKit's
-// remote-view-controller internals: WARootViewController -_containedRemoteViewController
-// / -_remoteSheet got no-ops, the caller (WhatsApp's plugin/scene setup)
-// called them, got nil, and WARequire -> WAHandleFailureInFunction -> abort.
-// These are NOT in the app binary — stock NO lets the engine use its
-// fallback path. CoreUI's _dynamicContextEvaluation is likewise internal.
+// v25: case-insensitive blocklist! v24's strstr() checks were case-sensitive
+// ("ContainedRemoteViewController" vs the actual selector
+// "_containedRemoteViewController" — lowercase 'c') so the remote-VC
+// selectors STILL got synthesized and the scene-connection abort (165815)
+// repeated. strcasestr fixes it.
 static BOOL wa_blocklistedSelector(const char *name) {
-    if (strncmp(name, "nsli", 4) == 0) return YES;            // CoreAutoLayout NSIS protocol
-    if (strstr(name, "DynamicContext") != NULL) return YES;   // CoreUI evaluation probe
-    if (strstr(name, "ContainedRemoteViewController") != NULL) return YES; // UIKit remote-VC internals
-    if (strstr(name, "RemoteSheet") != NULL) return YES;      // UIKit remote-sheet internals
+    if (strncasecmp(name, "nsli", 4) == 0) return YES;      // CoreAutoLayout NSIS protocol
+    if (strcasestr(name, "DynamicContext") != NULL) return YES;  // CoreUI evaluation probe
+    if (strcasestr(name, "ContainedRemoteViewController") != NULL) return YES; // UIKit remote-VC internals
+    if (strcasestr(name, "RemoteSheet") != NULL) return YES;  // UIKit remote-sheet internals
     return NO;
 }
 
@@ -757,8 +752,8 @@ static void wa_swizzle_inst(Class cls, SEL sel, IMP imp, IMP *origOut) {
 
 __attribute__((constructor))
 static void wa_init(void) {
-    os_log_info(wa_log(), "waContainerFix v24 constructor running");
-    wa_marker(@"=== waContainerFix v24 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v25 constructor running");
+    wa_marker(@"=== waContainerFix v25 constructor ===");
 
     // v10/v11: anti-tamper evasion — init dyld interpose reals FIRST so the
     // fakes are correct before any swizzle/launch activity
