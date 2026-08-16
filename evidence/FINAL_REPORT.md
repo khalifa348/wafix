@@ -9,28 +9,63 @@
 
 ---
 
-## 1. EXECUTIVE SUMMARY
+## ⚠️ CORRECTION (2026-08-16, ME73c realistic-count run) — t7 DOWNGRADED
+
+**ME73c drove the SAME t7 handler with a REALISTIC server count (100) — and the crash is byte-identical
+to the 0x7FFFFFFF runs (same site 0x3379ec, same fault-address family 0x18a0 vs 0x18f0–0x1ab0).**
+
+A count-driven index would fault at count×8 offset: 0x320 for count=100 vs 0x3FFFFFFF8 for
+0x7FFFFFFF — **4 billion bytes apart**. The observed faults are all within 0x50 of each other,
+so **the count parameter does NOT drive the fault**. Root cause of the t7 crashes:
+
+1. `didOfflineResumeStartWithType:totalStanzasCount:` is a **Swift async method** — its
+   runtime-visible IMPs (0x1003379e0 and 0x10037460c) are **async-thunk glue**, not the method body.
+2. ME73/ME73c called those thunks on a **zeroed `class_createInstance`** from the dylib
+   constructor → the async machinery retains garbage → `objc_retain` SIGSEGV in libobjc
+   (+0x144c) with the WhatsApp thunk (0x3379ec) as caller.
+3. The static "unchecked table index" helper @0x100337b88 (`ldrsw x8,[x8,#0x10]` →
+   `ldr x25,[x21,x8]`) is a **separate function never reached in any crash** — neither
+   runtime IMP calls it, and the crash happens before any method body executes.
+4. The ME73 "control" (count=100 returning) **never executed** — the marker died at the
+   0x7FFFFFFF call first; "control returned" was assumed, not observed.
+
+**Honest status: t7 = harness artifact, NOT a count-driven zero-click crash. Removed from
+the zero-click claim. The on-wire validation (real server → realistic count → pristine app)
+is the only remaining path to prove or disprove a real count-driven bug at this site —
+and it remains blocked on a fresh WhatsApp number.**
+
+site-1/site-2 (companion-device family) keep their RED status as **index-driven OOB reads**
+(the faulting read consumes the poisoned idx2 directly), BUT their realistic-value ladder
+(does idx2=100/1000/100000 crash with the same recipe?) was NOT run before this correction
+and is queued as ME73d.
+
+---
+
+## 1. EXECUTIVE SUMMARY (revised after ME73c)
 
 Fifteen (15) **deterministic on-device crashes** were produced in WhatsApp's own code frames
 across **three entry points** of one bug family: **server-supplied counts / device-list data
 reaching an unchecked pointer-table read** (`ldr xN, [base, idx]` with no bounds check).
+**Post-ME73c, t7's 10 crashes are reclassified as a harness artifact** (async-thunk glue on a
+zeroed instance — count-independent, proven by count=100 crashing identically to 0x7FFFFFFF).
+The remaining 5 (site-1 2× + site-2 3×) remain genuine index-driven OOB reads in WhatsApp's
+own frames, pending realistic-value and on-wire validation.
 
-- **t7 — `didOfflineResumeStartWithType:totalStanzasCount:`** (10 REDs): the server-supplied
-  offline-resume stanza count is used as a **raw byte offset into a dispatch table** with
-  zero validation → SIGSEGV on `objc_retain` of garbage in WhatsApp's own frame
-  (0x3379ec / helper `XPluginsGetListLookupDataPair`). **Remote input directly drives the fault.**
+- ~~**t7 — `didOfflineResumeStartWithType:totalStanzasCount:` (10 REDs)**~~ → **RETRACTED as
+  count-driven. Harness artifact** (zeroed crafted instance + Swift async thunk glue). Static
+  helper @0x337b88 remains a *suspicion* (unchecked `ldrsw/ldr`), never dynamically reached.
 - **site-1 — `fetchPendingRemovalCompanionDevicesForAccountUserJID:`** (2 REDs): shared
   index struct poisoned → `doesNotRecognizeSelector:` SIGABRT thrown from WhatsApp's frame.
 - **site-2 — `fetchLinkedAndPendingRemovalCompanionDevicesForAccountUserJID:currentDeviceList:`**
   (3 REDs): same family, byte-identical stacks, 3/3 deterministic.
 
-**Attack-reach classification (per user requirement):**
+**Attack-reach classification (revised):**
 
 | Site | Reach | Status |
 |---|---|---|
-| t7 (offline-resume count) | **ZERO-CLICK candidate** — server stanza field → crash at launch/resume, no user interaction | Crash PROVEN on-device; static QA: FAIL (no clamp/check in path); realistic server values 0–200k assessed unsafe |
-| site-1 (companion-device removal) | **ONE-CLICK candidate** — companion-device sync/list flows (login, linked-devices) | Crash PROVEN 2/2; on-wire remote path pending (fresh number blocked) |
-| site-2 (linked+pending removal) | **ONE-CLICK candidate** — same companion-device family | Crash PROVEN 3/3 byte-identical; on-wire remote path pending |
+| ~~t7 (offline-resume count)~~ | ~~ZERO-CLICK~~ | **RETRACTED (harness artifact, ME73c)** — count-independent crash; no zero-click claim |
+| site-1 (companion-device removal) | **ONE-CLICK candidate** — companion-device sync/list flows (login, linked-devices) | Crash PROVEN 2/2 (index-driven OOB); realistic-value ladder + on-wire pending |
+| site-2 (linked+pending removal) | **ONE-CLICK candidate** — same companion-device family | Crash PROVEN 3/3 byte-identical (index-driven OOB); realistic-value ladder + on-wire pending |
 | ME72n lead1 (processPersistedStanza completion struct) | **TUNNEL-ONLY** — struct built by app's own NSE-merge machinery, not attacker-set | NOT remote-reachable; proven local-drive only (documented, excluded from bank) |
 
 ---
