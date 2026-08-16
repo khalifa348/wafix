@@ -1,0 +1,17 @@
+name: build-me73d
+on: [push]
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: compile me73d test dylib (iOS arm64)
+        run: |
+          xcrun -sdk iphoneos clang -arch arm64 -dynamiclib -fobjc-arc \
+            -O1 -o libwaContainerFix.dylib me73d.m \
+            -isysroot $(xcrun -sdk iphoneos --show-sdk-path) \
+            -framework Foundation -Wl,-install_name,@rpath/libwaContainerFix.dylib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wafix-dylib
+          path: libwaContainerFix.dylib
