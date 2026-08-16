@@ -340,6 +340,18 @@ static id wa_noop(id self, SEL _cmd) { return nil; }
 static _Thread_local BOOL wa_resolvingInst = NO;
 static _Thread_local BOOL wa_resolvingCls = NO;
 
+// v20: only synthesize missing selectors for WhatsApp's OWN classes.
+// v19 crashed in BaseBoard's BSXPCCoder +initialize (recursive +initialize
+// SIGTRAP, crash 161132): the global NSObject resolver ran for system classes
+// during UIKit startup — class_addMethod invalidates the method cache, the
+// runtime re-enters +initialize on the same thread → trap. System classes
+// get stock behavior (return NO) — their selectors are never missing anyway.
+static BOOL wa_isWhatsAppClass(Class cls) {
+    const char *img = class_getImageName(cls);
+    if (!img) return NO;
+    return strstr(img, "WhatsApp") != NULL;
+}
+
 // does the class DIRECTLY define forwardInvocation:? (no resolution trigger)
 static BOOL wa_hasRealForwardingDirect(Class cls) {
     unsigned int count = 0;
@@ -374,6 +386,9 @@ static BOOL wa_resolveInstance(id self, SEL _cmd, SEL name) {
     const char *selName = sel_getName(name);
     // v9: os_log private path — stock behavior, instant NO, no log/marker churn
     if (wa_isOsLogSelector(selName)) return NO;
+    // v20: WhatsApp classes only — never synthesize for system classes
+    // (BaseBoard BSXPCCoder +initialize recursion trap, crash 161132)
+    if (!wa_isWhatsAppClass(cls)) return NO;
     // v11: NO os_log here — os_log's encoding path can itself trigger
     // class_respondsToSelector -> resolveMethod_locked -> re-entry (ME40
     // crash stack showed exactly that). Marker file is our ground truth.
@@ -397,6 +412,9 @@ static BOOL wa_resolveClass(id self, SEL _cmd, SEL name) {
     const char *selName = sel_getName(name);
     // v9: os_log private path — stock behavior, instant NO
     if (wa_isOsLogSelector(selName)) return NO;
+    // v20: WhatsApp classes only (class-method resolution runs on metaclasses;
+    // the metaclass image is the same as the class's)
+    if (!wa_isWhatsAppClass(meta)) return NO;
     // v11: NO os_log here (re-entry vector, see wa_resolveInstance)
     wa_markerOnce([NSString stringWithFormat:@"RESOLVE-CLASS %s +%s", clsName, selName]);
     if (wa_hasRealForwardingDirect(meta)) {
@@ -700,8 +718,8 @@ static void wa_swizzle_inst(Class cls, SEL sel, IMP imp, IMP *origOut) {
 
 __attribute__((constructor))
 static void wa_init(void) {
-    os_log_info(wa_log(), "waContainerFix v19 constructor running");
-    wa_marker(@"=== waContainerFix v19 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v20 constructor running");
+    wa_marker(@"=== waContainerFix v20 constructor ===");
 
     // v10/v11: anti-tamper evasion — init dyld interpose reals FIRST so the
     // fakes are correct before any swizzle/launch activity
