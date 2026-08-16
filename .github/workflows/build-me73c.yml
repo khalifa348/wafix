@@ -1,0 +1,19 @@
+name: build-me73c
+on: [push]
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: compile me73c test dylib (iOS arm64)
+        run: |
+          xcrun -sdk iphoneos clang -arch arm64 -dynamiclib \
+            -miphoneos-version-min=15.0 -fobjc-arc \
+            -framework Foundation me73c.m -o libwaContainerFix.dylib
+          lipo -info libwaContainerFix.dylib
+          file libwaContainerFix.dylib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wafix-dylib
+          path: libwaContainerFix.dylib
+          if-no-files-error: error
