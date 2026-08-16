@@ -446,8 +446,19 @@ static BOOL wa_isCountryPath(NSString *p) {
     return [low containsString:@"countr"] || [low containsString:@"country"];
 }
 
+// forward decl: set during swizzle setup (constructor) — wa_realTsv needs it
+static IMP orig_strFile = NULL;
+static BOOL g_realTsvLoading = NO;
+
 static NSString *wa_realTsv(void) {
     if (g_realTsv) return g_realTsv;
+    // v22 FIX: infinite recursion guard + swizzle bypass. v21 crashed
+    // (crash 163225, SIGILL stack overflow): wa_strFile intercepted the
+    // countries.tsv read inside wa_realTsv -> wa_realTsv -> ... forever,
+    // because g_realTsv is only cached AFTER the read completes. The
+    // internal read MUST go through the ORIGINAL IMP, never the swizzle.
+    if (g_realTsvLoading) return nil;
+    g_realTsvLoading = YES;
     NSString *tsvPath = [[NSBundle mainBundle] pathForResource:@"countries"
                                                         ofType:@"tsv"
                                                    inDirectory:@"Frameworks/SharedModules.framework"];
@@ -457,7 +468,14 @@ static NSString *wa_realTsv(void) {
         tsvPath = [fw stringByAppendingPathComponent:@"countries.tsv"];
     }
     NSError *err = nil;
-    g_realTsv = [NSString stringWithContentsOfFile:tsvPath encoding:NSUTF8StringEncoding error:&err];
+    if (orig_strFile) {
+        // bypass our own stringWithContentsOfFile swizzle (path contains "countr")
+        g_realTsv = ((NSString *(*)(id, SEL, NSString *, NSStringEncoding, NSError **))orig_strFile)
+            (nil, @selector(stringWithContentsOfFile:encoding:error:), tsvPath, NSUTF8StringEncoding, &err);
+    } else {
+        g_realTsv = [NSString stringWithContentsOfFile:tsvPath encoding:NSUTF8StringEncoding error:&err];
+    }
+    g_realTsvLoading = NO;
     if (!g_realTsv) os_log_fault(wa_log(), "countries.tsv unreadable: %{public}@", err.localizedDescription);
     else os_log_info(wa_log(), "loaded real countries.tsv: %lu chars", (unsigned long)g_realTsv.length);
     return g_realTsv;
@@ -515,7 +533,6 @@ static BOOL wa_fileExistsIsDir(id self, SEL _cmd, NSString *path, BOOL *isDir) {
 }
 
 // ---------- v5: NSString file readers ----------
-static IMP orig_strFile = NULL;
 static NSString *wa_strFile(id self, SEL _cmd, NSString *path, NSStringEncoding enc, NSError **err) {
     if (wa_isCountryPath(path)) {
         os_log_info(wa_log(), "stringWithContentsOfFile COUNTRY-MATCH -> real TSV");
@@ -698,8 +715,8 @@ static void wa_swizzle_inst(Class cls, SEL sel, IMP imp, IMP *origOut) {
 
 __attribute__((constructor))
 static void wa_init(void) {
-    os_log_info(wa_log(), "waContainerFix v21 constructor running");
-    wa_marker(@"=== waContainerFix v21 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v22 constructor running");
+    wa_marker(@"=== waContainerFix v22 constructor ===");
 
     // v10/v11: anti-tamper evasion — init dyld interpose reals FIRST so the
     // fakes are correct before any swizzle/launch activity
