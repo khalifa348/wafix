@@ -45,6 +45,8 @@
 #import <netdb.h>
 #import <arpa/inet.h>
 #import <netinet/in.h>
+#import <fcntl.h>
+#import <unistd.h>
 
 // forward decl (wa_marker defined later in file)
 static void wa_marker(NSString *line);
@@ -285,23 +287,30 @@ static os_log_t wa_log(void) {
 //   Also: markers now de-duplicated — only NEW (class, selector) combos are
 //   written, so a hot selector can't stall launch with 1000s of file writes.
 
-static NSString *wa_markerPath(void) {
-    return [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/wafix_marker.txt"];
-}
+// v19: marker path + write moved to pure POSIX inside wa_marker (see below);
+// this Foundation helper removed — it was part of the re-entry crash path.
 
 static void wa_marker(NSString *line) {
-    @autoreleasepool {
-        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:wa_markerPath()];
-        if (!fh) {
-            [[NSFileManager defaultManager] createFileAtPath:wa_markerPath() contents:nil attributes:nil];
-            fh = [NSFileHandle fileHandleForWritingAtPath:wa_markerPath()];
-        }
-        if (fh) {
-            [fh seekToEndOfFile];
-            [fh writeData:[[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]];
-            [fh closeFile];
-        }
+    // v19 FIX: PURE POSIX marker write. v18 used NSFileHandle/NSFileManager
+    // (Foundation) — our interposed _dyld_register_func_for_add_image is
+    // called from INSIDE os_log's own init (_os_trace_init_slow); Foundation
+    // file I/O there re-enters os_log_create on a held dispatch_once →
+    // "BUG IN CLIENT OF LIBDISPATCH: trying to lock recursively" → abort
+    // (crash 154235). open/write/close can never re-enter os_log or
+    // CoreServicesInternal, so markers are safe at ANY init stage.
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) return;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/Documents/wafix_marker.txt", home);
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return;
+    const char *s = line.UTF8String;
+    if (s) {
+        size_t n = strlen(s);
+        if (n) write(fd, s, n);
+        write(fd, "\n", 1);
     }
+    close(fd);
 }
 
 // de-dup: only log a (class, selector) combo once per run
@@ -691,8 +700,8 @@ static void wa_swizzle_inst(Class cls, SEL sel, IMP imp, IMP *origOut) {
 
 __attribute__((constructor))
 static void wa_init(void) {
-    os_log_info(wa_log(), "waContainerFix v18 constructor running");
-    wa_marker(@"=== waContainerFix v18 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v19 constructor running");
+    wa_marker(@"=== waContainerFix v19 constructor ===");
 
     // v10/v11: anti-tamper evasion — init dyld interpose reals FIRST so the
     // fakes are correct before any swizzle/launch activity
