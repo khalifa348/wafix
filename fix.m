@@ -42,6 +42,9 @@
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
 #import <dlfcn.h>
+#import <netdb.h>
+#import <arpa/inet.h>
+#import <netinet/in.h>
 
 // forward decl (wa_marker defined later in file)
 static void wa_marker(NSString *line);
@@ -165,6 +168,98 @@ static int wa_fake_dladdr(const void *addr, Dl_info *info) {
 WA_INTERPOSE(wa_fake_dyld_register_func_for_add_image, _dyld_register_func_for_add_image)
 WA_INTERPOSE(wa_fake_dyld_register_func_for_remove_image, _dyld_register_func_for_remove_image)
 WA_INTERPOSE(wa_fake_dladdr, dladdr)
+
+// ============ v18: Track B endpoint redirect (chat server → PC) ============
+// WhatsApp resolves its chat endpoint via getaddrinfo() on *.whatsapp.net /
+// *.whatsapp.com hosts. We interpose getaddrinfo: when the host matches the
+// chat-host allowlist AND a redirect config file exists, we return the PC
+// (fake server) address instead of the real WhatsApp server.
+//
+// The config file is Documents/wafix_redirect.txt, containing "IP:PORT"
+// (e.g. "192.168.110.143:5222"). NO file = NO redirect (pass-through, so
+// registration/real use still work). This is the runtime kill-switch:
+//   - registration phase: no file → app talks to real WhatsApp
+//   - test phase:        drop file → app's chat connection hits our PC
+//
+// We deliberately do NOT redirect media/telemetry subdomains (static.,
+// mmg., crashlogs., flows., graph., scontent.cdn., api.) — only the chat
+// host family (.whatsapp.net/.whatsapp.com top-levels that aren't media).
+static char g_redirect_ip[64] = {0};
+static int  g_redirect_port = 0;
+static int  g_redirect_checked = 0;
+
+static void wa_redirect_load(void) {
+    if (g_redirect_checked) return;  // read once per process (kill-switch = file presence at launch)
+    g_redirect_checked = 1;
+    NSString *cfg = [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
+                     stringByAppendingPathComponent:@"wafix_redirect.txt"];
+    NSString *s = [NSString stringWithContentsOfFile:cfg encoding:NSUTF8StringEncoding error:NULL];
+    if (!s || s.length == 0) return;  // no config → pass-through mode
+    s = [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSArray *parts = [s componentsSeparatedByString:@":"];
+    if (parts.count >= 2) {
+        NSString *ip = [parts[0] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        NSString *portStr = [parts[1] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        int port = portStr.intValue;
+        if (ip.length > 0 && port > 0 && port < 65536) {
+            strncpy(g_redirect_ip, ip.UTF8String, sizeof(g_redirect_ip) - 1);
+            g_redirect_port = port;
+            wa_marker([NSString stringWithFormat:@"REDIRECT cfg loaded: %s:%d", g_redirect_ip, g_redirect_port]);
+        } else {
+            wa_marker([NSString stringWithFormat:@"REDIRECT cfg INVALID: %@", s]);
+        }
+    } else {
+        wa_marker([NSString stringWithFormat:@"REDIRECT cfg malformed: %@", s]);
+    }
+}
+
+static BOOL wa_isChatHost(const char *node) {
+    if (!node) return NO;
+    size_t len = strlen(node);
+    // media/telemetry prefixes we must NOT redirect
+    static const char *skipPrefixes[] = {
+        "static.", "mmg.", "mmg-fallback.", "crashlogs.", "flows.", "graph.",
+        "scontent.cdn.", "api.", "cdn.", "0s.", "www.", NULL
+    };
+    for (int i = 0; skipPrefixes[i]; i++) {
+        size_t pl = strlen(skipPrefixes[i]);
+        if (len > pl && strncasecmp(node, skipPrefixes[i], pl) == 0) return NO;
+    }
+    // must end in .whatsapp.net or .whatsapp.com
+    static const char *suffixes[] = {".whatsapp.net", ".whatsapp.com", NULL};
+    for (int i = 0; suffixes[i]; i++) {
+        size_t sl = strlen(suffixes[i]);
+        if (len > sl && strcasecmp(node + len - sl, suffixes[i]) == 0) return YES;
+    }
+    return NO;
+}
+
+static int wa_fake_getaddrinfo(const char *node, const char *service,
+                               const struct addrinfo *hints,
+                               struct addrinfo **res) {
+    wa_redirect_load();
+    if (g_redirect_port != 0 && wa_isChatHost(node)) {
+        struct addrinfo *ai = calloc(1, sizeof(struct addrinfo));
+        struct sockaddr_in *sa = calloc(1, sizeof(struct sockaddr_in));
+        sa->sin_family = AF_INET;
+        sa->sin_port = htons((uint16_t)g_redirect_port);
+        inet_pton(AF_INET, g_redirect_ip, &sa->sin_addr);
+        ai->ai_family = AF_INET;
+        ai->ai_socktype = SOCK_STREAM;
+        ai->ai_protocol = IPPROTO_TCP;
+        ai->ai_addrlen = sizeof(struct sockaddr_in);
+        ai->ai_addr = (struct sockaddr *)sa;
+        ai->ai_next = NULL;
+        *res = ai;
+        wa_marker([NSString stringWithFormat:@"REDIRECT %s → %s:%d", node, g_redirect_ip, g_redirect_port]);
+        return 0;
+    }
+    // passthrough: call the REAL getaddrinfo directly (v15 pattern — dyld
+    // resolves our own imports to the real libsystem function)
+    return getaddrinfo(node, service, hints, res);
+}
+
+WA_INTERPOSE(wa_fake_getaddrinfo, getaddrinfo)
 
 static os_log_t wa_log(void) {
     static os_log_t l;
@@ -596,8 +691,8 @@ static void wa_swizzle_inst(Class cls, SEL sel, IMP imp, IMP *origOut) {
 
 __attribute__((constructor))
 static void wa_init(void) {
-    os_log_info(wa_log(), "waContainerFix v17 constructor running");
-    wa_marker(@"=== waContainerFix v17 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v18 constructor running");
+    wa_marker(@"=== waContainerFix v18 constructor ===");
 
     // v10/v11: anti-tamper evasion — init dyld interpose reals FIRST so the
     // fakes are correct before any swizzle/launch activity
