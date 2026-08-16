@@ -386,23 +386,15 @@ static BOOL wa_resolveInstance(id self, SEL _cmd, SEL name) {
     const char *selName = sel_getName(name);
     // v9: os_log private path — stock behavior, instant NO, no log/marker churn
     if (wa_isOsLogSelector(selName)) return NO;
-    // v20: WhatsApp classes only — never synthesize for system classes
-    // (BaseBoard BSXPCCoder +initialize recursion trap, crash 161132)
-    if (!wa_isWhatsAppClass(cls)) return NO;
-    // v11: NO os_log here — os_log's encoding path can itself trigger
-    // class_respondsToSelector -> resolveMethod_locked -> re-entry (ME40
-    // crash stack showed exactly that). Marker file is our ground truth.
-    wa_markerOnce([NSString stringWithFormat:@"RESOLVE-INST %s -%s", clsName, selName]);
-    if (wa_hasRealForwardingDirect(cls)) {
-        return NO;
-    }
-    wa_resolvingInst = YES;
-    BOOL added = class_addMethod(cls, name, (IMP)wa_noop, "@@:");
-    wa_resolvingInst = NO;
-    if (!added && !wa_hasMethodDirect(cls, name)) {
-        return NO;
-    }
-    return YES;
+    // v21: NO SYNTHESIS AT ALL — stock behavior. v20's universal no-op
+    // synthesis made UIKit/CoreAutoLayout internal probes (nsli_*,
+    // _dynamicContextEvaluation:, -displayLayer: etc.) return YES; the engine
+    // then CALLS the no-op, gets nil back, and throws "no common ancestor"
+    // in -[NSLayoutConstraint _setActive:] (crash 161954/162457). These
+    // probes are NOT in the app binary — stock NO is the correct answer.
+    // Marker file kept for diagnostics only.
+    wa_markerOnce([NSString stringWithFormat:@"RESOLVE-INST %s -%s (NO)", clsName, selName]);
+    return NO;
 }
 
 static BOOL wa_resolveClass(id self, SEL _cmd, SEL name) {
@@ -412,21 +404,9 @@ static BOOL wa_resolveClass(id self, SEL _cmd, SEL name) {
     const char *selName = sel_getName(name);
     // v9: os_log private path — stock behavior, instant NO
     if (wa_isOsLogSelector(selName)) return NO;
-    // v20: WhatsApp classes only (class-method resolution runs on metaclasses;
-    // the metaclass image is the same as the class's)
-    if (!wa_isWhatsAppClass(meta)) return NO;
-    // v11: NO os_log here (re-entry vector, see wa_resolveInstance)
-    wa_markerOnce([NSString stringWithFormat:@"RESOLVE-CLASS %s +%s", clsName, selName]);
-    if (wa_hasRealForwardingDirect(meta)) {
-        return NO;
-    }
-    wa_resolvingCls = YES;
-    BOOL added = class_addMethod(meta, name, (IMP)wa_noop, "@@:");
-    wa_resolvingCls = NO;
-    if (!added && !wa_hasMethodDirect(meta, name)) {
-        return NO;
-    }
-    return YES;
+    // v21: NO SYNTHESIS (see wa_resolveInstance) — stock behavior only.
+    wa_markerOnce([NSString stringWithFormat:@"RESOLVE-CLASS %s +%s (NO)", clsName, selName]);
+    return NO;
 }
 
 // ---------- v2: nil-guard +[NSURL fileURLWithPath:] ----------
@@ -718,8 +698,8 @@ static void wa_swizzle_inst(Class cls, SEL sel, IMP imp, IMP *origOut) {
 
 __attribute__((constructor))
 static void wa_init(void) {
-    os_log_info(wa_log(), "waContainerFix v20 constructor running");
-    wa_marker(@"=== waContainerFix v20 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v21 constructor running");
+    wa_marker(@"=== waContainerFix v21 constructor ===");
 
     // v10/v11: anti-tamper evasion — init dyld interpose reals FIRST so the
     // fakes are correct before any swizzle/launch activity
