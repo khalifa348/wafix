@@ -1,11 +1,17 @@
-# ME73 — t7 PROVEN: server-stanza count drives unchecked table-index crash
+# ME73 — t7 RETRACTED (superseded by FINAL_REPORT.md rev. 3)
+
+> **⚠️ RETRACTED 2026-08-16.** This file was written before the control tests. The crashes
+> below are **harness artifacts**, not a server-stanza-driven bug: ME73c proved the crash is
+> count-INDEPENDENT (count=100 faults byte-identically to 0x7FFFFFFF — faults within 0x50 vs
+> the 4 GB apart a count-driven index would produce), and the "control" never ran. See
+> `FINAL_REPORT.md` (Correction 1) for the full falsification. Kept for the record.
 
 **Date:** 2026-08-15 07:50 (device reconnected, ME73_inj_signed.ipa installed 07:49:54)
 **Device:** iPhone 18,2 (T8150), iOS 26.6 (23G71), jailed
 **Build:** net.whatsapp.WhatsAppSMB 26.24.72 (test copy of pristine App Store build) + libwaContainerFix.dylib (105,360 B signed)
 **Lead:** t7 — `didOfflineResumeStartWithType:totalStanzasCount:` (category WAIncomingMessageHandlingMain / WAMessageBatchingConfigurator) — server-supplied count drives unchecked table index in Swift helper @0x100337b88 / thunk region 0x1003379e0.
 
-## Result: DETERMINISTIC CRASH 2/2 — first server-stanza-driven fault
+## Original claim (RETRACTED): "DETERMINISTIC CRASH 2/2 — first server-stanza-driven fault"
 
 | Crash | Time | Fault | WhatsApp frame | Drive orig (x8) |
 |---|---|---|---|---|
