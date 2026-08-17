@@ -274,6 +274,12 @@ WA_INTERPOSE(wa_fake_getaddrinfo, getaddrinfo)
 // and the host is a chat host, rewrite to the PC IP:port.
 typedef NSObject *nw_endpoint_t;  // opaque OS_OBJECT — pointer-only use
 
+// declare the symbol so WA_INTERPOSE can take its address (dlsym at runtime
+// still finds the REAL one via RTLD_NEXT — two-level namespace on iOS means
+// an undefined nw_* symbol would not resolve at load time with only
+// Foundation linked, hence the dlsym approach)
+extern nw_endpoint_t nw_endpoint_create_host(const char *hostname, const char *port);
+
 static nw_endpoint_t (*wa_real_nw_endpoint_create_host)(const char *, const char *);
 
 static nw_endpoint_t wa_fake_nw_endpoint_create_host(const char *hostname, const char *port) {
