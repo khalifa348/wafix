@@ -428,7 +428,7 @@ static void wa_drive_log_view(id view, int depth) {
     @autoreleasepool {
         NSString *cls = NSStringFromClass(object_getClass(view));
         // frame via NSInvocation (struct return)
-        CGRect fr = CGRectZero;
+        CGRect fr = {0};  // no CGRectZero — CI links Foundation+Network only
         SEL frameSel = NSSelectorFromString(@"frame");
         if ([view respondsToSelector:frameSel]) {
             NSMethodSignature *sig = [view methodSignatureForSelector:frameSel];
