@@ -291,12 +291,22 @@ static nw_endpoint_t wa_fake_nw_endpoint_create_host(const char *hostname, const
         if (!wa_real_nw_endpoint_create_host) return nil;  // cannot happen in practice
     }
     wa_redirect_load();
-    if (g_redirect_port != 0 && hostname && wa_isChatHost(hostname)) {
-        char portbuf[16];
-        snprintf(portbuf, sizeof(portbuf), "%d", g_redirect_port);
-        wa_marker([NSString stringWithFormat:@"REDIRECT nw %s:%s → %s:%s",
-                   hostname, port ? port : "?", g_redirect_ip, portbuf]);
-        return wa_real_nw_endpoint_create_host(g_redirect_ip, portbuf);
+    // v29: log EVERY call (passthrough included) so zero-lines is conclusive —
+    // v28 only logged redirects and a silent passthrough was indistinguishable
+    // from "interpose never fired"
+    if (hostname && wa_isChatHost(hostname)) {
+        if (g_redirect_port != 0) {
+            char portbuf[16];
+            snprintf(portbuf, sizeof(portbuf), "%d", g_redirect_port);
+            wa_marker([NSString stringWithFormat:@"REDIRECT nw %s:%s → %s:%s",
+                       hostname, port ? port : "?", g_redirect_ip, portbuf]);
+            return wa_real_nw_endpoint_create_host(g_redirect_ip, portbuf);
+        }
+        wa_marker([NSString stringWithFormat:@"NW-CHATHOST %s:%s (no cfg → passthrough)",
+                   hostname, port ? port : "?"]);
+    } else if (hostname) {
+        wa_marker([NSString stringWithFormat:@"NW-ENDPOINT %s:%s (non-chat)",
+                   hostname, port ? port : "?"]);
     }
     return wa_real_nw_endpoint_create_host(hostname, port);
 }
@@ -803,8 +813,8 @@ static void wa_swizzle_inst(Class cls, SEL sel, IMP imp, IMP *origOut) {
 
 __attribute__((constructor))
 static void wa_init(void) {
-    os_log_info(wa_log(), "waContainerFix v28 constructor running");
-    wa_marker(@"=== waContainerFix v28 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v29 constructor running");
+    wa_marker(@"=== waContainerFix v29 constructor ===");
 
     // v10/v11: anti-tamper evasion — init dyld interpose reals FIRST so the
     // fakes are correct before any swizzle/launch activity
