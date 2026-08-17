@@ -801,7 +801,7 @@ static void wa_swap_storage_root(void) {
         if (wa_is_storage_vc(root)) {
             id good = wa_make_good_root();
             if (good) {
-                [w setRootViewController:good];
+                [w performSelector:@selector(setRootViewController:) withObject:good];
                 wa_marker([NSString stringWithFormat:@"BYPASS SWAPPED storage root -> %s",
                            class_getName(object_getClass(good))]);
             }
