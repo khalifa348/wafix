@@ -40,6 +40,7 @@
 #import <Foundation/Foundation.h>
 #import <os/log.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <mach-o/dyld.h>
 #import <dlfcn.h>
 #import <netdb.h>
@@ -478,6 +479,31 @@ static void wa_drive_run(void) {
         NSString *trimmed = [cmd stringByTrimmingCharactersInSet:
                              [NSCharacterSet whitespaceAndNewlineCharacterSet]];
         if ([trimmed hasPrefix:@"DUMP"]) {
+            // v46: dump gate-class method lists once (find the recovery API)
+            static int wa_dumped_gates = 0;
+            if (!wa_dumped_gates) {
+                wa_dumped_gates = 1;
+                const char *gateCls[] = {
+                    "WAChatListLowStorageRecoveryHandler",
+                    "WALowStorageAlerts",
+                    "WACriticallyLowStorageViewController",
+                    "WALowStorageBannerManager",
+                    "WAStorageWarningViewController",
+                    "FBStorageKitMonitor",
+                    "FBWrappedStorageKitConfig",
+                };
+                for (int gi = 0; gi < 7; gi++) {
+                    Class g = NSClassFromString([NSString stringWithUTF8String:gateCls[gi]]);
+                    if (!g) { wa_marker([NSString stringWithFormat:@"GATE %s (absent)", gateCls[gi]]); continue; }
+                    wa_marker([NSString stringWithFormat:@"GATE %s:", gateCls[gi]]);
+                    unsigned int mc = 0;
+                    Method *mets = class_copyMethodList(g, &mc);
+                    for (unsigned int mj = 0; mj < mc && mj < 40; mj++) {
+                        wa_marker([NSString stringWithFormat:@"  GATE  -%s", sel_getName(method_getName(mets[mj]))]);
+                    }
+                    if (mets) free(mets);
+                }
+            }
             // v40: log root class + presented chain per window (diagnosis)
             for (id w in windows) {
                 id root = [w performSelector:NSSelectorFromString(@"rootViewController")];
@@ -909,10 +935,31 @@ static void wa_setRootVC_block(id self, SEL _cmd, id vc) {
 // contains critically-low-storage markers to a zero-returning stub.
 // Deliberately NOT matching bare "storage" (would nuke WAChatStorage DB
 // methods). Idempotent: re-entry sees the stub already installed.
+// v46: broader net. StorageKit (Meta framework) drives the real state and
+// lives OUTSIDE the WhatsApp image — match any image for the strict needles,
+// and "storage" only inside WhatsApp images (protects WAChatStorage DB).
+// NEVER zero `lowStorageRecoveryHandler` (nil handler kills app's recovery).
 static id wa_stub_zero(id self, SEL _cmd) { (void)self; (void)_cmd; return 0; }
 
+static int wa_sel_is_storage_related(const char *sn, int inWhatsApp) {
+    char lower[256];
+    size_t k = 0;
+    for (; sn[k] && k < sizeof(lower) - 1; k++) lower[k] = (sn[k] >= 'A' && sn[k] <= 'Z') ? sn[k] + 32 : sn[k];
+    lower[k] = 0;
+    const char *strict[] = { "criticallow", "lowspace", "lowstorage", "criticaldisk", "diskstate" };
+    for (int m = 0; m < 5; m++) if (strstr(lower, strict[m])) return 1;
+    if (inWhatsApp && strstr(lower, "storage")) {
+        // protect the recovery HANDLER getter and the DB classes' storage methods
+        if (strstr(lower, "recoveryhandler")) return 0;
+        if (strstr(lower, "chatstorage")) return 0;
+        if (strstr(lower, "databasestorage")) return 0;
+        if (strstr(lower, "mediastorage")) return 0;
+        return 1;
+    }
+    return 0;
+}
+
 static void wa_neutralize_storage_reads(void) {
-    const char *needles[] = { "criticallow", "lowspace", "lowstorage" };
     int n = objc_getClassList(NULL, 0);
     if (n <= 0) return;
     Class *classes = (Class *)malloc(sizeof(Class) * n);
@@ -922,7 +969,10 @@ static void wa_neutralize_storage_reads(void) {
         Class cls = classes[i];
         if (class_isMetaClass(cls)) continue;
         const char *img = class_getImageName(cls);
-        if (!img || !strstr(img, "WhatsApp.app/WhatsApp")) continue;
+        int inWhatsApp = img && strstr(img, "WhatsApp.app/WhatsApp");
+        // strict needles match ANY image; "storage" needs the WhatsApp image
+        // so we don't neuter StorageKit's own plumbing needed by recovery
+        if (!inWhatsApp && !(img && (strstr(img, "StorageKit") || strstr(img, "FBSDK") || strstr(img, "Meta")))) continue;
         // instance methods
         unsigned int mc = 0;
         Method *methods = class_copyMethodList(cls, &mc);
@@ -930,17 +980,11 @@ static void wa_neutralize_storage_reads(void) {
             SEL sel = method_getName(methods[j]);
             const char *sn = sel_getName(sel);
             if (!sn) continue;
-            char lower[256];
-            size_t k = 0;
-            for (; sn[k] && k < sizeof(lower) - 1; k++) lower[k] = (sn[k] >= 'A' && sn[k] <= 'Z') ? sn[k] + 32 : sn[k];
-            lower[k] = 0;
-            int hit = 0;
-            for (int m = 0; m < 3; m++) if (strstr(lower, needles[m])) { hit = 1; break; }
-            if (!hit) continue;
+            if (!wa_sel_is_storage_related(sn, inWhatsApp)) continue;
             IMP cur = class_getMethodImplementation(cls, sel);
             if (cur == (IMP)wa_stub_zero) continue;
             method_setImplementation(methods[j], (IMP)wa_stub_zero);
-            if (neutered < 24) wa_marker([NSString stringWithFormat:@"NEUTRAL inst %s %s", class_getName(cls), sn]);
+            if (neutered < 30) wa_marker([NSString stringWithFormat:@"NEUTRAL inst %s %s", class_getName(cls), sn]);
             neutered++;
         }
         if (methods) free(methods);
@@ -952,17 +996,11 @@ static void wa_neutralize_storage_reads(void) {
             SEL sel = method_getName(cms[j]);
             const char *sn = sel_getName(sel);
             if (!sn) continue;
-            char lower[256];
-            size_t k = 0;
-            for (; sn[k] && k < sizeof(lower) - 1; k++) lower[k] = (sn[k] >= 'A' && sn[k] <= 'Z') ? sn[k] + 32 : sn[k];
-            lower[k] = 0;
-            int hit = 0;
-            for (int m = 0; m < 3; m++) if (strstr(lower, needles[m])) { hit = 1; break; }
-            if (!hit) continue;
+            if (!wa_sel_is_storage_related(sn, inWhatsApp)) continue;
             IMP cur = class_getMethodImplementation(meta, sel);
             if (cur == (IMP)wa_stub_zero) continue;
             method_setImplementation(cms[j], (IMP)wa_stub_zero);
-            if (neutered < 24) wa_marker([NSString stringWithFormat:@"NEUTRAL cls %s %s", class_getName(cls), sn]);
+            if (neutered < 30) wa_marker([NSString stringWithFormat:@"NEUTRAL cls %s %s", class_getName(cls), sn]);
             neutered++;
         }
         if (cms) free(cms);
@@ -1644,8 +1682,8 @@ static void wa_init(void) {
     // v34: fresh marker per launch (old log storms could reach 68 MB and
     // freeze the main thread; we only need THIS launch's ground truth)
     wa_marker_reset();
-    os_log_info(wa_log(), "waContainerFix v45 constructor running");
-    wa_marker(@"=== waContainerFix v45 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v46 constructor running");
+    wa_marker(@"=== waContainerFix v46 constructor ===");
 
     // v43: register an image-load callback — fires the MOMENT UIKitCore (and
     // every other image) loads, which is BEFORE application:didFinishLaunching.
@@ -1696,6 +1734,33 @@ static void wa_init(void) {
                        dispatch_get_main_queue(), ^{
             wa_dismiss_storage_modal();
             wa_swap_storage_root();
+            // v46: poke the app's OWN recovery path + hard-dismiss the stuck
+            // modal from itself (dismissal on the presented VC is legal)
+            id app = [(id)NSClassFromString(@"UIApplication") performSelector:NSSelectorFromString(@"sharedApplication")];
+            if (app) {
+                id windows = [app respondsToSelector:NSSelectorFromString(@"windows")]
+                             ? [app performSelector:NSSelectorFromString(@"windows")] : nil;
+                for (id w in windows) {
+                    id root = [w performSelector:NSSelectorFromString(@"rootViewController")];
+                    if (!root) continue;
+                    id presented = [root performSelector:@selector(presentedViewController)];
+                    if (presented) {
+                        SEL dsel = NSSelectorFromString(@"dismissViewControllerAnimated:completion:");
+                        if ([presented respondsToSelector:dsel])
+                            ((void (*)(id, SEL, BOOL, id))objc_msgSend)(presented, dsel, NO, nil);
+                        wa_marker([NSString stringWithFormat:@"BYPASS hard-dismiss %@",
+                                   NSStringFromClass(object_getClass(presented))]);
+                    }
+                    Class chatCls = NSClassFromString(@"WAChatListViewController");
+                    if (chatCls && [root isKindOfClass:chatCls]) {
+                        SEL rsel = NSSelectorFromString(@"didRecoverFromLowStorage");
+                        if ([root respondsToSelector:rsel]) {
+                            ((void (*)(id, SEL))objc_msgSend)(root, rsel);
+                            wa_marker(@"BYPASS poked didRecoverFromLowStorage");
+                        }
+                    }
+                }
+            }
         });
     }
 
