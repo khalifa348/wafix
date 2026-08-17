@@ -1,16 +1,7 @@
-// waContainerFix v18 — v17 + FULL hiding restored (count/name/header) +
-// callback REPLAY fix. ME47-ME69 lesson (22 rounds, all RED): v17's probe
-// (interpose ONLY dladdr+callbacks, NO count/name/header hiding) traps at
-// launch in BaseBoard _BSXPCAutoCodingInitialize (EXC_BREAKPOINT/SIGTRAP):
-// with our dylib VISIBLE in the real image list but dladdr DENYING it,
-// Apple's XPC auto-coding init sees an inconsistent dyld state -> trap.
-// v16-style full hiding keeps the list consistent (our image invisible
-// everywhere). ALSO fixed: the add/remove register fakes now REPLAY the
-// already-loaded images to each newly registered callback (real dyld
-// semantics) — v16/v17 stored the callback AFTER registering the bridge, so
-// the bridge's initial replay reached the user callback with an empty list.
-// v14/v13 lesson: dlsym capture self-interposes -> call imported symbols
-// DIRECTLY (dyld never self-interposes the interposer).
+// waContainerFix v14 — v10 + lazy interpose init (reals valid pre-constructor)
+// + resolver rewritten: no class_getInstanceMethod/class_getMethodImplementation/
+// os_log inside resolver (all three re-enter resolveMethod_locked -> infinite
+// recursion -> stack overflow. ME40 crash 03:18:59: 6+ alternating frames).
 // v11 = v10 dyld-interpose anti-detection + thread-local recursion guards +
 // direct method-list scans + marker-only resolver logging.
 // v9 (ME39) proven: os_log flood GONE (3 unique resolves vs 1518), resolver
@@ -51,6 +42,13 @@
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
 #import <dlfcn.h>
+#import <netdb.h>
+#import <arpa/inet.h>
+#import <netinet/in.h>
+#import <CoreGraphics/CoreGraphics.h>
+#import <objc/message.h>
+#import <fcntl.h>
+#import <unistd.h>
 
 // forward decl (wa_marker defined later in file)
 static void wa_marker(NSString *line);
@@ -141,17 +139,6 @@ static void wa_fake_dyld_register_func_for_add_image(void (*func)(const struct m
     if (func) {
         if (g_wa_cb_add_count == 0) _dyld_register_func_for_add_image(wa_bridge_add);  // direct = REAL
         if (g_wa_cb_add_count < 8) g_wa_cb_add[g_wa_cb_add_count++] = func;
-        // v18: REPLAY already-loaded images to the new callback (real dyld
-        // registers first, then replays every loaded image synchronously).
-        // v16/v17 stored the callback AFTER registering the bridge, so the
-        // bridge's initial replay fired with an empty list -> BaseBoard's
-        // XPC auto-coding table never populated -> launch trap.
-        uint32_t n = _dyld_image_count();  // direct = REAL
-        for (uint32_t i = 0; i < n; i++) {
-            const struct mach_header *mh = _dyld_get_image_header(i);
-            if (mh == g_ourHeader) continue;
-            func(mh, _dyld_get_image_vmaddr_slide(i));
-        }
     }
 }
 
@@ -177,17 +164,485 @@ static int wa_fake_dladdr(const void *addr, Dl_info *info) {
     _wa_interpose_##replacee __attribute__((section("__DATA,__interpose"))) = { \
         (const void *)(unsigned long)&replacement, (const void *)(unsigned long)&replacee };
 
-// v18: FULL hiding restored — interpose count/name/header + dladdr + callbacks.
-// v17 probe (dladdr+callbacks only) answered its question NEGATIVELY: partial
-// hiding leaves our image VISIBLE in the real list while dladdr denies it ->
-// BaseBoard XPC auto-coding init traps at launch (ME47-ME69, 22 RED rounds).
-// Full hiding (v16-style) keeps the image list internally consistent.
-WA_INTERPOSE(wa_fake_dyld_image_count, _dyld_image_count)
-WA_INTERPOSE(wa_fake_dyld_get_image_name, _dyld_get_image_name)
-WA_INTERPOSE(wa_fake_dyld_get_image_header, _dyld_get_image_header)
+// v17 PROBE: interpose ONLY dladdr + callbacks. NO count/name/header hiding.
+// Question: does dladdr-hiding ALONE trip the ~23s fast check? If yes, the
+// fast check is dladdr/consistency-based and ALL hiding is impossible via
+// interpose (→ merge architecture). If death moves to ~150s, the fast check
+// is enumeration-based.
 WA_INTERPOSE(wa_fake_dyld_register_func_for_add_image, _dyld_register_func_for_add_image)
 WA_INTERPOSE(wa_fake_dyld_register_func_for_remove_image, _dyld_register_func_for_remove_image)
 WA_INTERPOSE(wa_fake_dladdr, dladdr)
+
+// ============ v18: Track B endpoint redirect (chat server → PC) ============
+// WhatsApp resolves its chat endpoint via getaddrinfo() on *.whatsapp.net /
+// *.whatsapp.com hosts. We interpose getaddrinfo: when the host matches the
+// chat-host allowlist AND a redirect config file exists, we return the PC
+// (fake server) address instead of the real WhatsApp server.
+//
+// The config file is Documents/wafix_redirect.txt, containing "IP:PORT"
+// (e.g. "192.168.110.143:5222"). NO file = NO redirect (pass-through, so
+// registration/real use still work). This is the runtime kill-switch:
+//   - registration phase: no file → app talks to real WhatsApp
+//   - test phase:        drop file → app's chat connection hits our PC
+//
+// We deliberately do NOT redirect media/telemetry subdomains (static.,
+// mmg., crashlogs., flows., graph., scontent.cdn., api.) — only the chat
+// host family (.whatsapp.net/.whatsapp.com top-levels that aren't media).
+static char g_redirect_ip[64] = {0};
+static int  g_redirect_port = 0;
+static int  g_redirect_checked = 0;
+
+static void wa_redirect_load(void) {
+    if (g_redirect_checked) return;  // read once per process (kill-switch = file presence at launch)
+    g_redirect_checked = 1;
+    NSString *cfg = [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
+                     stringByAppendingPathComponent:@"wafix_redirect.txt"];
+    NSString *s = [NSString stringWithContentsOfFile:cfg encoding:NSUTF8StringEncoding error:NULL];
+    if (!s || s.length == 0) return;  // no config → pass-through mode
+    s = [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSArray *parts = [s componentsSeparatedByString:@":"];
+    if (parts.count >= 2) {
+        NSString *ip = [parts[0] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        NSString *portStr = [parts[1] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        int port = portStr.intValue;
+        if (ip.length > 0 && port > 0 && port < 65536) {
+            strncpy(g_redirect_ip, ip.UTF8String, sizeof(g_redirect_ip) - 1);
+            g_redirect_port = port;
+            wa_marker([NSString stringWithFormat:@"REDIRECT cfg loaded: %s:%d", g_redirect_ip, g_redirect_port]);
+        } else {
+            wa_marker([NSString stringWithFormat:@"REDIRECT cfg INVALID: %@", s]);
+        }
+    } else {
+        wa_marker([NSString stringWithFormat:@"REDIRECT cfg malformed: %@", s]);
+    }
+}
+
+static BOOL wa_isChatHost(const char *node) {
+    if (!node) return NO;
+    size_t len = strlen(node);
+    // media/telemetry prefixes we must NOT redirect
+    static const char *skipPrefixes[] = {
+        "static.", "mmg.", "mmg-fallback.", "crashlogs.", "flows.", "graph.",
+        "scontent.cdn.", "api.", "cdn.", "0s.", "www.", NULL
+    };
+    for (int i = 0; skipPrefixes[i]; i++) {
+        size_t pl = strlen(skipPrefixes[i]);
+        if (len > pl && strncasecmp(node, skipPrefixes[i], pl) == 0) return NO;
+    }
+    // must end in .whatsapp.net or .whatsapp.com
+    static const char *suffixes[] = {".whatsapp.net", ".whatsapp.com", NULL};
+    for (int i = 0; suffixes[i]; i++) {
+        size_t sl = strlen(suffixes[i]);
+        if (len > sl && strcasecmp(node + len - sl, suffixes[i]) == 0) return YES;
+    }
+    return NO;
+}
+
+static int wa_fake_getaddrinfo(const char *node, const char *service,
+                               const struct addrinfo *hints,
+                               struct addrinfo **res) {
+    wa_redirect_load();
+    if (g_redirect_port != 0 && wa_isChatHost(node)) {
+        struct addrinfo *ai = calloc(1, sizeof(struct addrinfo));
+        struct sockaddr_in *sa = calloc(1, sizeof(struct sockaddr_in));
+        sa->sin_family = AF_INET;
+        sa->sin_port = htons((uint16_t)g_redirect_port);
+        inet_pton(AF_INET, g_redirect_ip, &sa->sin_addr);
+        ai->ai_family = AF_INET;
+        ai->ai_socktype = SOCK_STREAM;
+        ai->ai_protocol = IPPROTO_TCP;
+        ai->ai_addrlen = sizeof(struct sockaddr_in);
+        ai->ai_addr = (struct sockaddr *)sa;
+        ai->ai_next = NULL;
+        *res = ai;
+        wa_marker([NSString stringWithFormat:@"REDIRECT %s → %s:%d", node, g_redirect_ip, g_redirect_port]);
+        return 0;
+    }
+    // passthrough: call the REAL getaddrinfo directly (v15 pattern — dyld
+    // resolves our own imports to the real libsystem function)
+    return getaddrinfo(node, service, hints, res);
+}
+
+WA_INTERPOSE(wa_fake_getaddrinfo, getaddrinfo)
+
+// ---------- v28: NWConnection endpoint redirect (tb3b) ----------
+// v18 hook getaddrinfo NEVER FIRES on iOS 26: the app resolves chat hosts
+// via Network.framework (nw_endpoint_create_host), whose DNS resolution
+// happens daemon-side (mDNSResponder) — libc getaddrinfo is not called at
+// all (marker had ZERO "REDIRECT cfg loaded" lines even though that line
+// writes on the FIRST getaddrinfo of any kind).
+// v28 interposes nw_endpoint_create_host: EVERY NWConnection created from a
+// hostname flows through this function. When the redirect file is present
+// and the host is a chat host, rewrite to the PC IP:port.
+typedef NSObject *nw_endpoint_t;  // opaque OS_OBJECT — pointer-only use
+
+// declare the symbol so WA_INTERPOSE can take its address (dlsym at runtime
+// still finds the REAL one via RTLD_NEXT — two-level namespace on iOS means
+// an undefined nw_* symbol would not resolve at load time with only
+// Foundation linked, hence the dlsym approach)
+extern nw_endpoint_t nw_endpoint_create_host(const char *hostname, const char *port);
+
+static nw_endpoint_t (*wa_real_nw_endpoint_create_host)(const char *, const char *);
+
+static nw_endpoint_t wa_fake_nw_endpoint_create_host(const char *hostname, const char *port) {
+    if (!wa_real_nw_endpoint_create_host) {
+        // RTLD_NEXT from our image finds the real one in Network.framework
+        // (the app links it, so it is loaded by the time any NWConnection
+        // is created). Avoids adding -framework Network to the CI build.
+        wa_real_nw_endpoint_create_host = dlsym(RTLD_NEXT, "nw_endpoint_create_host");
+        if (!wa_real_nw_endpoint_create_host) return nil;  // cannot happen in practice
+    }
+    wa_redirect_load();
+    // v29: log EVERY call (passthrough included) so zero-lines is conclusive —
+    // v28 only logged redirects and a silent passthrough was indistinguishable
+    // from "interpose never fired"
+    if (hostname && wa_isChatHost(hostname)) {
+        if (g_redirect_port != 0) {
+            char portbuf[16];
+            snprintf(portbuf, sizeof(portbuf), "%d", g_redirect_port);
+            wa_marker([NSString stringWithFormat:@"REDIRECT nw %s:%s → %s:%s",
+                       hostname, port ? port : "?", g_redirect_ip, portbuf]);
+            return wa_real_nw_endpoint_create_host(g_redirect_ip, portbuf);
+        }
+        wa_marker([NSString stringWithFormat:@"NW-CHATHOST %s:%s (no cfg → passthrough)",
+                   hostname, port ? port : "?"]);
+    } else if (hostname) {
+        wa_marker([NSString stringWithFormat:@"NW-ENDPOINT %s:%s (non-chat)",
+                   hostname, port ? port : "?"]);
+    }
+    return wa_real_nw_endpoint_create_host(hostname, port);
+}
+WA_INTERPOSE(wa_fake_nw_endpoint_create_host, nw_endpoint_create_host)
+
+// ---------- v30: nw_connection_create + connect() hooks ----------
+// WHY v30: v28/v29 interposed nw_endpoint_create_host, but the MAIN BINARY
+// imports only 4 nw_* symbols — nw_connection_create, nw_connection_start,
+// nw_connection_send, nw_connection_receive (+ _nw_connection_cancel,
+// _nw_connection_set_queue) — NOT nw_endpoint_create_host. Zero NW-ENDPOINT
+// lines across the v28+v29 marker segments ⇒ the app never calls it
+// (endpoints come from a different layer/path). v30 hooks:
+//   * nw_connection_create — EVERY NWConnection, host- OR address-based
+//   * connect() — the raw BSD socket path (PJSIP pj_sock_* layer)
+// nw_connection_create redirects when the endpoint's hostname is a chat host
+// and the redirect file is present; connect() logs destinations (diag only).
+typedef NSObject *nw_parameters_t;  // opaque OS_OBJECT — pointer-only use
+
+extern nw_endpoint_t nw_connection_create(nw_endpoint_t endpoint, nw_parameters_t parameters);
+extern const char *nw_endpoint_get_hostname(nw_endpoint_t endpoint);
+extern uint16_t nw_endpoint_get_port(nw_endpoint_t endpoint);
+
+static nw_endpoint_t (*wa_real_nw_connection_create)(nw_endpoint_t, nw_parameters_t);
+
+static nw_endpoint_t wa_fake_nw_connection_create(nw_endpoint_t endpoint, nw_parameters_t parameters) {
+    if (!wa_real_nw_connection_create) {
+        wa_real_nw_connection_create = dlsym(RTLD_NEXT, "nw_connection_create");
+        if (!wa_real_nw_connection_create) return nil;
+    }
+    // read the endpoint's hostname if it has one (host-based endpoints only;
+    // address-based endpoints return NULL)
+    const char *host = nw_endpoint_get_hostname ? nw_endpoint_get_hostname(endpoint) : NULL;
+    uint16_t eport = nw_endpoint_get_port ? nw_endpoint_get_port(endpoint) : 0;
+    wa_redirect_load();
+    if (host && wa_isChatHost(host)) {
+        if (g_redirect_port != 0) {
+            char portbuf[16];
+            snprintf(portbuf, sizeof(portbuf), "%d", g_redirect_port);
+            wa_marker([NSString stringWithFormat:@"REDIRECT conn %s:%u → %s:%s",
+                       host, eport, g_redirect_ip, portbuf]);
+            // rebuild the endpoint onto the PC IP:port, keep parameters
+            nw_endpoint_t ne = nw_endpoint_create_host(g_redirect_ip, portbuf);
+            if (ne) return wa_real_nw_connection_create(ne, parameters);
+        }
+        wa_marker([NSString stringWithFormat:@"NW-CONN chathost %s:%u (no cfg → passthrough)",
+                   host, eport]);
+    } else if (host) {
+        wa_marker([NSString stringWithFormat:@"NW-CONN %s:%u (non-chat)", host, eport]);
+    } else {
+        wa_marker(@"NW-CONN (address-based endpoint)");
+    }
+    return wa_real_nw_connection_create(endpoint, parameters);
+}
+WA_INTERPOSE(wa_fake_nw_connection_create, nw_connection_create)
+
+// connect() — raw BSD socket path (PJSIP socket layer). Diagnostic: log
+// every outbound TCP connect destination so we can see whether the chat
+// socket goes through raw sockets instead of Network.framework.
+static int (*wa_real_connect)(int, const struct sockaddr *, socklen_t);
+
+// dedupe: keep at most N unique (ip:port) destinations logged
+#define WA_CONNECT_LOG_MAX 40
+static char g_connect_seen[WA_CONNECT_LOG_MAX][48];
+static int g_connect_seen_n = 0;
+
+static int wa_fake_connect(int fd, const struct sockaddr *addr, socklen_t len) {
+    if (!wa_real_connect) {
+        wa_real_connect = dlsym(RTLD_NEXT, "connect");
+        if (!wa_real_connect) return connect(fd, addr, len);
+    }
+    if (addr && (addr->sa_family == AF_INET || addr->sa_family == AF_INET6)) {
+        char ipbuf[INET6_ADDRSTRLEN] = {0};
+        int port = 0;
+        if (addr->sa_family == AF_INET) {
+            const struct sockaddr_in *sin = (const struct sockaddr_in *)addr;
+            inet_ntop(AF_INET, &sin->sin_addr, ipbuf, sizeof(ipbuf));
+            port = ntohs(sin->sin_port);
+        } else {
+            const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)addr;
+            inet_ntop(AF_INET6, &sin6->sin6_addr, ipbuf, sizeof(ipbuf));
+            port = ntohs(sin6->sin6_port);
+        }
+        if (port != 0 && ipbuf[0]) {
+            char line[64];
+            snprintf(line, sizeof(line), "%s:%d", ipbuf, port);
+            int seen = 0;
+            for (int i = 0; i < g_connect_seen_n; i++) {
+                if (strcmp(g_connect_seen[i], line) == 0) { seen = 1; break; }
+            }
+            if (!seen && g_connect_seen_n < WA_CONNECT_LOG_MAX) {
+                strncpy(g_connect_seen[g_connect_seen_n], line, sizeof(g_connect_seen[g_connect_seen_n]) - 1);
+                g_connect_seen_n++;
+                wa_marker([NSString stringWithFormat:@"CONNECT %s", line]);
+            }
+        }
+    }
+    return wa_real_connect(fd, addr, len);
+}
+WA_INTERPOSE(wa_fake_connect, connect)
+
+// ---------- v31: in-app UI driver (registration drive) ----------
+// The app is network-idle at the welcome screen — no connection exists to
+// redirect until registration advances. dvt accessibility needs root
+// tunneld (blocked), screenshots render black (failret), so drive the UI
+// from INSIDE the process via a command file:
+//   Documents/wafix_drive.txt, one command per line, read once at +8s:
+//     DUMP            → log view hierarchy (class, frame, text, label)
+//     TYPE <digits>   → focus first UITextField + insertText (real typing)
+//     TAP <classpart> → sendActionsForControlEvents:TouchUpInside on the
+//                       first UIControl whose class name contains classpart
+//   No file / empty → no UI action; app behaves normally.
+// All UIKit access via performSelector/NSInvocation — the CI build links
+// only Foundation+Network, so no compile-time UIKit symbols.
+
+static void wa_drive_log_view(id view, int depth) {
+    if (!view || depth > 10) return;
+    @autoreleasepool {
+        NSString *cls = NSStringFromClass(object_getClass(view));
+        // frame via NSInvocation (struct return)
+        CGRect fr = {0};  // no CGRectZero — CI links Foundation+Network only
+        SEL frameSel = NSSelectorFromString(@"frame");
+        if ([view respondsToSelector:frameSel]) {
+            NSMethodSignature *sig = [view methodSignatureForSelector:frameSel];
+            if (sig) {
+                NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+                inv.target = view;
+                inv.selector = frameSel;
+                [inv invoke];
+                [inv getReturnValue:&fr];
+            }
+        }
+        NSString *extra = @"";
+        if ([view isKindOfClass:NSClassFromString(@"UITextField")]) {
+            id txt = [view performSelector:NSSelectorFromString(@"text")];
+            if (txt) extra = [NSString stringWithFormat:@" text=\"%@\"", txt];
+        }
+        id al = [view respondsToSelector:NSSelectorFromString(@"accessibilityLabel")]
+                ? [view performSelector:NSSelectorFromString(@"accessibilityLabel")] : nil;
+        if (al) extra = [extra stringByAppendingFormat:@" label=\"%@\"", al];
+        wa_marker([NSString stringWithFormat:@"UI %*s%@ f=%.0f,%.0f %.0fx%.0f%@",
+                   depth * 2, "", cls, fr.origin.x, fr.origin.y, fr.size.width, fr.size.height, extra]);
+        id subs = [view respondsToSelector:NSSelectorFromString(@"subviews")]
+                  ? [view performSelector:NSSelectorFromString(@"subviews")] : nil;
+        for (id sv in subs) wa_drive_log_view(sv, depth + 1);
+    }
+}
+
+static void wa_drive_run(void) {
+    NSString *cfg = [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
+                     stringByAppendingPathComponent:@"wafix_drive.txt"];
+    NSString *s = [NSString stringWithContentsOfFile:cfg encoding:NSUTF8StringEncoding error:NULL];
+    if (!s) return;
+    NSArray *lines = [s componentsSeparatedByString:@"\n"];
+    wa_marker([NSString stringWithFormat:@"DRIVE cfg: %@", s]);
+    id app = [(id)NSClassFromString(@"UIApplication") performSelector:NSSelectorFromString(@"sharedApplication")];
+    if (!app) { wa_marker(@"DRIVE no UIApplication"); return; }
+    id windows = [app respondsToSelector:NSSelectorFromString(@"windows")]
+                 ? [app performSelector:NSSelectorFromString(@"windows")] : nil;
+    if (!windows) { wa_marker(@"DRIVE no windows"); return; }
+    NSArray *cmds = [lines filteredArrayUsingPredicate:
+                     [NSPredicate predicateWithFormat:@"length > 0"]];
+    for (NSString *cmd in cmds) {
+        NSString *trimmed = [cmd stringByTrimmingCharactersInSet:
+                             [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if ([trimmed hasPrefix:@"DUMP"]) {
+            for (id w in windows) wa_drive_log_view(w, 0);
+        } else if ([trimmed hasPrefix:@"TYPE "]) {
+            NSString *digits = [trimmed substringFromIndex:5];
+            // find the first visible UITextField in any window
+            id field = nil;
+            for (id w in windows) {
+                // walk subviews recursively looking for UITextField
+                __block id found = nil;
+                void (^walk)(id) = ^(id v) {
+                    if (found) return;
+                    if ([v isKindOfClass:NSClassFromString(@"UITextField")]) { found = v; return; }
+                    id subs = [v respondsToSelector:NSSelectorFromString(@"subviews")]
+                              ? [v performSelector:NSSelectorFromString(@"subviews")] : nil;
+                    for (id sv in subs) walk(sv);
+                };
+                walk(w);
+                if (found) { field = found; break; }
+            }
+            if (field) {
+                [field performSelector:NSSelectorFromString(@"becomeFirstResponder")];
+                wa_marker([NSString stringWithFormat:@"DRIVE typing %@ into %@",
+                           digits, NSStringFromClass(object_getClass(field))]);
+                // insertText: goes through the real UITextInput pipeline
+                [field performSelector:NSSelectorFromString(@"insertText:") withObject:digits];
+                id txt = [field performSelector:NSSelectorFromString(@"text")];
+                wa_marker([NSString stringWithFormat:@"DRIVE field now: %@", txt]);
+            } else {
+                wa_marker(@"DRIVE no UITextField found");
+            }
+        } else if ([trimmed hasPrefix:@"TAP "]) {
+            NSString *part = [trimmed substringFromIndex:4];
+            id ctrl = nil;
+            for (id w in windows) {
+                __block id found = nil;
+                void (^walk)(id) = ^(id v) {
+                    if (found) return;
+                    NSString *cn = NSStringFromClass(object_getClass(v));
+                    if ([cn rangeOfString:part].location != NSNotFound &&
+                        [v respondsToSelector:NSSelectorFromString(@"sendActionsForControlEvents:")]) {
+                        found = v; return;
+                    }
+                    id subs = [v respondsToSelector:NSSelectorFromString(@"subviews")]
+                              ? [v performSelector:NSSelectorFromString(@"subviews")] : nil;
+                    for (id sv in subs) walk(sv);
+                };
+                walk(w);
+                if (found) { ctrl = found; break; }
+            }
+            if (ctrl) {
+                wa_marker([NSString stringWithFormat:@"DRIVE tapping %@ (%@)",
+                           NSStringFromClass(object_getClass(ctrl)), part]);
+                // UIControlEventTouchUpInside == 1 << 6 — performSelector can't
+                // take integers, so call through objc_msgSend instead
+                ((void (*)(id, SEL, unsigned long))objc_msgSend)(
+                    ctrl, NSSelectorFromString(@"sendActionsForControlEvents:"), 1UL << 6);
+            } else {
+                wa_marker([NSString stringWithFormat:@"DRIVE no control matching %@", part]);
+            }
+        } else if ([trimmed hasPrefix:@"STATS"]) {
+            // v32: log device storage stats from inside the app
+            NSFileManager *fm = [NSFileManager defaultManager];
+            NSDictionary *attrs = [fm attributesOfFileSystemForPath:NSHomeDirectory()
+                                                              error:nil];
+            long long freeBytes = [attrs[NSFileSystemFreeSize] longLongValue];
+            long long totalBytes = [attrs[NSFileSystemSize] longLongValue];
+            wa_marker([NSString stringWithFormat:@"STATS free=%.1fMB total=%.1fMB",
+                       freeBytes / 1048576.0, totalBytes / 1048576.0]);
+        } else {
+            wa_marker([NSString stringWithFormat:@"DRIVE unknown cmd: %@", trimmed]);
+        }
+    }
+}
+
+// ---------- v32: low-storage gate bypass ----------
+// WhatsApp blocks at a "Storage is full" screen when the device is low on
+// space, before any UI/network work. Neutralize the gate so the app reaches
+// the welcome screen. The gate selectors (from binary string scan):
+//   -presentLowStorageModalIfNeededFromParent:
+//   -showLowStorageModalIfNeeded
+//   -shouldHandleLowStorage
+//   -criticallyLowStorageDidOccur:
+static void wa_noop_void_id(id self, SEL _cmd, id arg) { (void)self; (void)_cmd; (void)arg; }
+static void wa_noop_void(id self, SEL _cmd) { (void)self; (void)_cmd; }
+static BOOL wa_noop_false(id self, SEL _cmd) { (void)self; (void)_cmd; return NO; }
+
+static void wa_bypass_low_storage(void) {
+    int n = objc_getClassList(NULL, 0);
+    if (n <= 0) return;
+    Class *classes = (Class *)malloc(sizeof(Class) * n);
+    n = objc_getClassList(classes, n);
+    const char *selNames[] = {
+        "presentLowStorageModalIfNeededFromParent:",
+        "showLowStorageModalIfNeeded",
+        "criticallyLowStorageDidOccur:",
+    };
+    SEL sels[3];
+    sels[0] = sel_registerName(selNames[0]);
+    sels[1] = sel_registerName(selNames[1]);
+    sels[2] = sel_registerName(selNames[2]);
+    int patched = 0;
+    int skipped_system = 0;
+    for (int i = 0; i < n; i++) {
+        Class cls = classes[i];
+        if (class_isMetaClass(cls)) continue;
+        // v33 FIX: ONLY patch classes from the main WhatsApp executable.
+        // v32 patched EVERY class with these selectors — including Apple
+        // system frameworks (CloudKit CK*: CKScopedResponder, CKTreeNode…),
+        // which crashed the app ~1s after launch (marker died mid-scan on
+        // CKScopedResponder). class_getImageName tells us which image a
+        // class came from; system classes are never touched now.
+        const char *img = class_getImageName(cls);
+        if (!img || !strstr(img, "WhatsApp.app/WhatsApp")) {
+            skipped_system++;
+            continue;
+        }
+        for (int k = 0; k < 3; k++) {
+            Method m = class_getInstanceMethod(cls, sels[k]);
+            if (m && method_getImplementation(m) != (IMP)wa_noop_void
+                 && method_getImplementation(m) != (IMP)wa_noop_void_id) {
+                IMP imp = (k == 2) ? (IMP)wa_noop_void_id : (IMP)wa_noop_void;
+                method_setImplementation(m, imp);
+                wa_marker([NSString stringWithFormat:@"BYPASS patched %s on %s",
+                           selNames[k], class_getName(cls)]);
+                patched++;
+            }
+        }
+        // shouldHandleLowStorage returns BOOL
+        SEL sh = sel_registerName("shouldHandleLowStorage");
+        Method mh = class_getInstanceMethod(cls, sh);
+        if (mh && method_getImplementation(mh) != (IMP)wa_noop_false) {
+            method_setImplementation(mh, (IMP)wa_noop_false);
+            wa_marker([NSString stringWithFormat:@"BYPASS patched shouldHandleLowStorage on %s",
+                       class_getName(cls)]);
+            patched++;
+        }
+    }
+    free(classes);
+    wa_marker([NSString stringWithFormat:@"BYPASS scan done (%d patches, %d system skipped)", patched, skipped_system]);
+}
+
+// Dismiss any presented low-storage / storage-warning modal so the app
+// proceeds even if the gate fired before we patched it.
+static void wa_dismiss_storage_modal(void) {
+    id app = [(id)NSClassFromString(@"UIApplication") performSelector:@selector(sharedApplication)];
+    if (!app) return;
+    id windows = [app performSelector:@selector(windows)];
+    for (id w in windows) {
+        id root = [w performSelector:@selector(rootViewController)];
+        id vc = root;
+        id presented = [vc performSelector:@selector(presentedViewController)];
+        while (presented) {
+            NSString *cn = NSStringFromClass(object_getClass(presented));
+            if ([cn containsString:@"LowStorage"] || [cn containsString:@"StorageWarning"]) {
+                wa_marker([NSString stringWithFormat:@"BYPASS dismissing %@", cn]);
+                [presented performSelector:@selector(dismissViewControllerAnimated:completion:)
+                                withObject:@NO withObject:nil];
+            }
+            vc = presented;
+            presented = [vc performSelector:@selector(presentedViewController)];
+        }
+    }
+}
+
+static void wa_drive_schedule(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        wa_drive_run();
+    });
+}
 
 static os_log_t wa_log(void) {
     static os_log_t l;
@@ -213,23 +668,30 @@ static os_log_t wa_log(void) {
 //   Also: markers now de-duplicated — only NEW (class, selector) combos are
 //   written, so a hot selector can't stall launch with 1000s of file writes.
 
-static NSString *wa_markerPath(void) {
-    return [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/wafix_marker.txt"];
-}
+// v19: marker path + write moved to pure POSIX inside wa_marker (see below);
+// this Foundation helper removed — it was part of the re-entry crash path.
 
 static void wa_marker(NSString *line) {
-    @autoreleasepool {
-        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:wa_markerPath()];
-        if (!fh) {
-            [[NSFileManager defaultManager] createFileAtPath:wa_markerPath() contents:nil attributes:nil];
-            fh = [NSFileHandle fileHandleForWritingAtPath:wa_markerPath()];
-        }
-        if (fh) {
-            [fh seekToEndOfFile];
-            [fh writeData:[[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]];
-            [fh closeFile];
-        }
+    // v19 FIX: PURE POSIX marker write. v18 used NSFileHandle/NSFileManager
+    // (Foundation) — our interposed _dyld_register_func_for_add_image is
+    // called from INSIDE os_log's own init (_os_trace_init_slow); Foundation
+    // file I/O there re-enters os_log_create on a held dispatch_once →
+    // "BUG IN CLIENT OF LIBDISPATCH: trying to lock recursively" → abort
+    // (crash 154235). open/write/close can never re-enter os_log or
+    // CoreServicesInternal, so markers are safe at ANY init stage.
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) return;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/Documents/wafix_marker.txt", home);
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return;
+    const char *s = line.UTF8String;
+    if (s) {
+        size_t n = strlen(s);
+        if (n) write(fd, s, n);
+        write(fd, "\n", 1);
     }
+    close(fd);
 }
 
 // de-dup: only log a (class, selector) combo once per run
@@ -251,6 +713,12 @@ static BOOL wa_isOsLogSelector(const char *sel) {
 
 static id wa_noop(id self, SEL _cmd) { return nil; }
 
+// v26: +bundleForClass on WhatsApp classes returns the app bundle (pristine
+// behavior). The asset loader WARequires non-nil — nil aborts launch.
+static id wa_bundleForClass(id self, SEL _cmd) {
+    return [NSBundle mainBundle];
+}
+
 // v11: NEVER call class_getInstanceMethod / class_getMethodImplementation
 // inside the resolver — those trigger resolveMethod_locked -> our swizzle ->
 // infinite recursion (ME40 crash 03:18:59: 6+ alternating frames, stack
@@ -258,6 +726,18 @@ static id wa_noop(id self, SEL _cmd) { return nil; }
 // class_copyMethodList (direct read, no resolution) + class_addMethod only.
 static _Thread_local BOOL wa_resolvingInst = NO;
 static _Thread_local BOOL wa_resolvingCls = NO;
+
+// v20: only synthesize missing selectors for WhatsApp's OWN classes.
+// v19 crashed in BaseBoard's BSXPCCoder +initialize (recursive +initialize
+// SIGTRAP, crash 161132): the global NSObject resolver ran for system classes
+// during UIKit startup — class_addMethod invalidates the method cache, the
+// runtime re-enters +initialize on the same thread → trap. System classes
+// get stock behavior (return NO) — their selectors are never missing anyway.
+static BOOL wa_isWhatsAppClass(Class cls) {
+    const char *img = class_getImageName(cls);
+    if (!img) return NO;
+    return strstr(img, "WhatsApp") != NULL;
+}
 
 // does the class DIRECTLY define forwardInvocation:? (no resolution trigger)
 static BOOL wa_hasRealForwardingDirect(Class cls) {
@@ -286,6 +766,19 @@ static BOOL wa_hasMethodDirect(Class cls, SEL sel) {
     return found;
 }
 
+// v25: case-insensitive blocklist! v24's strstr() checks were case-sensitive
+// ("ContainedRemoteViewController" vs the actual selector
+// "_containedRemoteViewController" — lowercase 'c') so the remote-VC
+// selectors STILL got synthesized and the scene-connection abort (165815)
+// repeated. strcasestr fixes it.
+static BOOL wa_blocklistedSelector(const char *name) {
+    if (strncasecmp(name, "nsli", 4) == 0) return YES;      // CoreAutoLayout NSIS protocol
+    if (strcasestr(name, "DynamicContext") != NULL) return YES;  // CoreUI evaluation probe
+    if (strcasestr(name, "ContainedRemoteViewController") != NULL) return YES; // UIKit remote-VC internals
+    if (strcasestr(name, "RemoteSheet") != NULL) return YES;  // UIKit remote-sheet internals
+    return NO;
+}
+
 static BOOL wa_resolveInstance(id self, SEL _cmd, SEL name) {
     if (wa_resolvingInst) return NO;   // recursion guard (thread-local)
     Class cls = (Class)self;
@@ -293,6 +786,11 @@ static BOOL wa_resolveInstance(id self, SEL _cmd, SEL name) {
     const char *selName = sel_getName(name);
     // v9: os_log private path — stock behavior, instant NO, no log/marker churn
     if (wa_isOsLogSelector(selName)) return NO;
+    // v20: WhatsApp classes only — never synthesize for system classes
+    // (BaseBoard BSXPCCoder +initialize recursion trap, crash 161132)
+    if (!wa_isWhatsAppClass(cls)) return NO;
+    // v23: blocklist check (nsli_* autolayout internals, CoreUI probes)
+    if (wa_blocklistedSelector(selName)) return NO;
     // v11: NO os_log here — os_log's encoding path can itself trigger
     // class_respondsToSelector -> resolveMethod_locked -> re-entry (ME40
     // crash stack showed exactly that). Marker file is our ground truth.
@@ -316,13 +814,24 @@ static BOOL wa_resolveClass(id self, SEL _cmd, SEL name) {
     const char *selName = sel_getName(name);
     // v9: os_log private path — stock behavior, instant NO
     if (wa_isOsLogSelector(selName)) return NO;
+    // v20: WhatsApp classes only (class-method resolution runs on metaclasses;
+    // the metaclass image is the same as the class's)
+    if (!wa_isWhatsAppClass(meta)) return NO;
+    // v23: blocklist check
+    if (wa_blocklistedSelector(selName)) return NO;
     // v11: NO os_log here (re-entry vector, see wa_resolveInstance)
     wa_markerOnce([NSString stringWithFormat:@"RESOLVE-CLASS %s +%s", clsName, selName]);
     if (wa_hasRealForwardingDirect(meta)) {
         return NO;
     }
     wa_resolvingCls = YES;
-    BOOL added = class_addMethod(meta, name, (IMP)wa_noop, "@@:");
+    // v26: +bundleForClass must return a REAL bundle, not nil. The asset
+    // loader (__WhatsAppAssetsImageLoaderClass) calls it during launch and
+    // WARequire's the result; pristine resolves it to the app bundle. nil
+    // → WAHandleFailureInFunction abort at XPluginsGetFuncPtr (crash 010857).
+    IMP imp = (strcmp(selName, "bundleForClass") == 0)
+                  ? (IMP)wa_bundleForClass : (IMP)wa_noop;
+    BOOL added = class_addMethod(meta, name, imp, "@@:");
     wa_resolvingCls = NO;
     if (!added && !wa_hasMethodDirect(meta, name)) {
         return NO;
@@ -367,8 +876,19 @@ static BOOL wa_isCountryPath(NSString *p) {
     return [low containsString:@"countr"] || [low containsString:@"country"];
 }
 
+// forward decl: set during swizzle setup (constructor) — wa_realTsv needs it
+static IMP orig_strFile = NULL;
+static BOOL g_realTsvLoading = NO;
+
 static NSString *wa_realTsv(void) {
     if (g_realTsv) return g_realTsv;
+    // v22 FIX: infinite recursion guard + swizzle bypass. v21 crashed
+    // (crash 163225, SIGILL stack overflow): wa_strFile intercepted the
+    // countries.tsv read inside wa_realTsv -> wa_realTsv -> ... forever,
+    // because g_realTsv is only cached AFTER the read completes. The
+    // internal read MUST go through the ORIGINAL IMP, never the swizzle.
+    if (g_realTsvLoading) return nil;
+    g_realTsvLoading = YES;
     NSString *tsvPath = [[NSBundle mainBundle] pathForResource:@"countries"
                                                         ofType:@"tsv"
                                                    inDirectory:@"Frameworks/SharedModules.framework"];
@@ -378,7 +898,14 @@ static NSString *wa_realTsv(void) {
         tsvPath = [fw stringByAppendingPathComponent:@"countries.tsv"];
     }
     NSError *err = nil;
-    g_realTsv = [NSString stringWithContentsOfFile:tsvPath encoding:NSUTF8StringEncoding error:&err];
+    if (orig_strFile) {
+        // bypass our own stringWithContentsOfFile swizzle (path contains "countr")
+        g_realTsv = ((NSString *(*)(id, SEL, NSString *, NSStringEncoding, NSError **))orig_strFile)
+            (nil, @selector(stringWithContentsOfFile:encoding:error:), tsvPath, NSUTF8StringEncoding, &err);
+    } else {
+        g_realTsv = [NSString stringWithContentsOfFile:tsvPath encoding:NSUTF8StringEncoding error:&err];
+    }
+    g_realTsvLoading = NO;
     if (!g_realTsv) os_log_fault(wa_log(), "countries.tsv unreadable: %{public}@", err.localizedDescription);
     else os_log_info(wa_log(), "loaded real countries.tsv: %lu chars", (unsigned long)g_realTsv.length);
     return g_realTsv;
@@ -436,7 +963,6 @@ static BOOL wa_fileExistsIsDir(id self, SEL _cmd, NSString *path, BOOL *isDir) {
 }
 
 // ---------- v5: NSString file readers ----------
-static IMP orig_strFile = NULL;
 static NSString *wa_strFile(id self, SEL _cmd, NSString *path, NSStringEncoding enc, NSError **err) {
     if (wa_isCountryPath(path)) {
         os_log_info(wa_log(), "stringWithContentsOfFile COUNTRY-MATCH -> real TSV");
@@ -619,8 +1145,26 @@ static void wa_swizzle_inst(Class cls, SEL sel, IMP imp, IMP *origOut) {
 
 __attribute__((constructor))
 static void wa_init(void) {
-    os_log_info(wa_log(), "waContainerFix v18 constructor running");
-    wa_marker(@"=== waContainerFix v18 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v33 constructor running");
+    wa_marker(@"=== waContainerFix v33 constructor ===");
+
+    // v32: low-storage gate bypass — run early and retry (classes may not be
+    // loaded yet at constructor time), then dismiss any shown modal later
+    wa_bypass_low_storage();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        wa_bypass_low_storage();
+        wa_dismiss_storage_modal();
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        wa_bypass_low_storage();
+        wa_dismiss_storage_modal();
+    });
+
+    // v31: schedule the in-app UI driver (registration drive) — reads
+    // Documents/wafix_drive.txt at +8s (DUMP/TYPE/TAP/STATS commands)
+    wa_drive_schedule();
 
     // v10/v11: anti-tamper evasion — init dyld interpose reals FIRST so the
     // fakes are correct before any swizzle/launch activity
