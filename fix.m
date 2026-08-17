@@ -461,6 +461,38 @@ static void wa_drive_log_view(id view, int depth) {
     }
 }
 
+static void wa_drive_log_text(id view, int depth) {
+    if (!view || depth > 12) return;
+    @autoreleasepool {
+        NSString *cls = NSStringFromClass(object_getClass(view));
+        // UILabel/UISearchBar-style text property
+        if ([view respondsToSelector:NSSelectorFromString(@"text")]) {
+            id t = [view performSelector:NSSelectorFromString(@"text")];
+            if ([t isKindOfClass:[NSString class]] && [t length])
+                wa_marker([NSString stringWithFormat:@"TXT %*s%@ text=%@", depth * 2, "", cls, t]);
+        }
+        // UIButton currentTitle
+        if ([view respondsToSelector:NSSelectorFromString(@"currentTitle")]) {
+            id t = [view performSelector:NSSelectorFromString(@"currentTitle")];
+            if ([t isKindOfClass:[NSString class]] && [t length])
+                wa_marker([NSString stringWithFormat:@"TXT %*s%@ btn=%@", depth * 2, "", cls, t]);
+        }
+        // UITextField placeholder
+        if ([view respondsToSelector:NSSelectorFromString(@"placeholder")]) {
+            id t = [view performSelector:NSSelectorFromString(@"placeholder")];
+            if ([t isKindOfClass:[NSString class]] && [t length])
+                wa_marker([NSString stringWithFormat:@"TXT %*s%@ ph=%@", depth * 2, "", cls, t]);
+        }
+        id al = [view respondsToSelector:NSSelectorFromString(@"accessibilityLabel")]
+                ? [view performSelector:NSSelectorFromString(@"accessibilityLabel")] : nil;
+        if ([al isKindOfClass:[NSString class]] && [al length])
+            wa_marker([NSString stringWithFormat:@"TXT %*s%@ ax=%@", depth * 2, "", cls, al]);
+        id subs = [view respondsToSelector:NSSelectorFromString(@"subviews")]
+                  ? [view performSelector:NSSelectorFromString(@"subviews")] : nil;
+        for (id sv in subs) wa_drive_log_text(sv, depth + 1);
+    }
+}
+
 static void wa_drive_run(void) {
     NSString *cfg = [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
                      stringByAppendingPathComponent:@"wafix_drive.txt"];
@@ -531,6 +563,10 @@ static void wa_drive_run(void) {
                 }
             }
             for (id w in windows) wa_drive_log_view(w, 0);
+        } else if ([trimmed hasPrefix:@"TEXT"]) {
+            // v50: dump every visible string (label text, button titles,
+            // field placeholders, AX labels) — screen truth without vision
+            for (id w in windows) wa_drive_log_text(w, 0);
         } else if ([trimmed hasPrefix:@"TYPE "]) {
             NSString *digits = [trimmed substringFromIndex:5];
             // find the first visible UITextField in any window
@@ -1690,8 +1726,8 @@ static void wa_init(void) {
     // v34: fresh marker per launch (old log storms could reach 68 MB and
     // freeze the main thread; we only need THIS launch's ground truth)
     wa_marker_reset();
-    os_log_info(wa_log(), "waContainerFix v49b constructor running");
-    wa_marker(@"=== waContainerFix v49b constructor ===");
+    os_log_info(wa_log(), "waContainerFix v50 constructor running");
+    wa_marker(@"=== waContainerFix v50 constructor ===");
 
     // v43: register an image-load callback — fires the MOMENT UIKitCore (and
     // every other image) loads, which is BEFORE application:didFinishLaunching.
