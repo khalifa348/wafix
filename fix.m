@@ -771,14 +771,51 @@ static void wa_presentModalVC_block(id self, SEL _cmd, id vc, BOOL animated) {
     ((void (*)(id, SEL, id, BOOL))orig)(self, _cmd, vc, animated);
 }
 
+// v39: the storage VC is the WINDOW ROOT (set at launch, before our +2s
+// patches) — not a presented modal. Dismissals can never remove a root VC,
+// which is why v36-v38 loops could not kill it. Fix: give the window the
+// app's NORMAL root (WARootViewController) instead, whenever a storage VC
+// shows up as root.
+static id wa_make_good_root(void) {
+    Class rvc = NSClassFromString(@"WARootViewController");
+    id vc = nil;
+    if (rvc) {
+        @try { vc = [rvc new]; } @catch (NSException *e) { vc = nil; }
+    }
+    if (!vc) {
+        Class blank = NSClassFromString(@"UIViewController");
+        if (blank) vc = [blank new];
+    }
+    return vc;
+}
+
+static void wa_swap_storage_root(void) {
+    id appCls = NSClassFromString(@"UIApplication");
+    if (!appCls) return;
+    id app = [appCls performSelector:@selector(sharedApplication)];
+    if (!app) return;
+    id wins = [app performSelector:@selector(windows)];
+    if (![wins isKindOfClass:[NSArray class]]) return;
+    for (id w in (NSArray *)wins) {
+        id root = [w performSelector:@selector(rootViewController)];
+        if (wa_is_storage_vc(root)) {
+            id good = wa_make_good_root();
+            if (good) {
+                [w setRootViewController:good];
+                wa_marker([NSString stringWithFormat:@"BYPASS SWAPPED storage root -> %s",
+                           class_getName(object_getClass(good))]);
+            }
+        }
+    }
+}
+
 static void wa_setRootVC_block(id self, SEL _cmd, id vc) {
     if (wa_is_storage_vc(vc)) {
         wa_marker([NSString stringWithFormat:@"BYPASS BLOCKED storage-modal setRoot from %s",
                    class_getName(object_getClass(self))]);
-        // give the window a blank root so the app's state machine can move on
-        Class blank = NSClassFromString(@"UIViewController");
-        if (blank) vc = [blank new];
-        else return;
+        // give the window the app's NORMAL root so the state machine moves on
+        vc = wa_make_good_root();
+        if (!vc) return;
     }
     IMP orig = wa_orig_pres_imp(object_getClass(self), _cmd);
     if (!orig) orig = orig_setRootVC;
@@ -1414,8 +1451,8 @@ static void wa_init(void) {
     // v34: fresh marker per launch (old log storms could reach 68 MB and
     // freeze the main thread; we only need THIS launch's ground truth)
     wa_marker_reset();
-    os_log_info(wa_log(), "waContainerFix v38 constructor running");
-    wa_marker(@"=== waContainerFix v38 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v39 constructor running");
+    wa_marker(@"=== waContainerFix v39 constructor ===");
 
     // v32: low-storage gate bypass — run early and retry (classes may not be
     // loaded yet at constructor time), then dismiss any shown modal later
@@ -1426,6 +1463,7 @@ static void wa_init(void) {
         wa_dismiss_storage_modal();
         wa_kill_storage_on_appear();
         wa_block_storage_presentation();
+        wa_swap_storage_root();
     });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
@@ -1433,13 +1471,15 @@ static void wa_init(void) {
         wa_dismiss_storage_modal();
         wa_kill_storage_on_appear();
         wa_block_storage_presentation();
+        wa_swap_storage_root();
     });
-    // v37: repeating storage-modal kill — the app re-presents the gate on a
-    // timer, so keep dismissing every 2 s for the first 2 minutes
+    // v37/v39: repeating storage-modal kill — the app re-presents the gate on a
+    // timer, so keep dismissing + root-swapping every 2 s for the first 2 minutes
     for (int i = 0; i < 60; i++) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((2 + i * 2) * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             wa_dismiss_storage_modal();
+            wa_swap_storage_root();
         });
     }
 
