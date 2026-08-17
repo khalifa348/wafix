@@ -53,6 +53,7 @@
 
 // forward decl (wa_marker defined later in file)
 static void wa_marker(NSString *line);
+static void wa_markerOnce(NSString *line);
 
 // ---------- v10: dyld interpose (anti-tamper evasion) ----------
 // v15: no real_* function pointers — the fakes call the imported symbols
