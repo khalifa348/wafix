@@ -562,7 +562,7 @@ static BOOL wa_noop_false(id self, SEL _cmd) { (void)self; (void)_cmd; return NO
 static void wa_bypass_low_storage(void) {
     int n = objc_getClassList(NULL, 0);
     if (n <= 0) return;
-    Class *classes = malloc(sizeof(Class) * n);
+    Class *classes = (Class *)malloc(sizeof(Class) * n);
     n = objc_getClassList(classes, n);
     const char *selNames[] = {
         "presentLowStorageModalIfNeededFromParent:",
