@@ -764,8 +764,8 @@ static void wa_swizzle_inst(Class cls, SEL sel, IMP imp, IMP *origOut) {
 
 __attribute__((constructor))
 static void wa_init(void) {
-    os_log_info(wa_log(), "waContainerFix v26 constructor running");
-    wa_marker(@"=== waContainerFix v26 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v27 constructor running");
+    wa_marker(@"=== waContainerFix v27 constructor ===");
 
     // v10/v11: anti-tamper evasion — init dyld interpose reals FIRST so the
     // fakes are correct before any swizzle/launch activity
