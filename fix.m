@@ -827,18 +827,32 @@ static void wa_swap_storage_root(void) {
             }
             continue;
         }
-        // v40: storage VC stuck in the presented chain — dismiss is failing,
-        // so nuke the whole root (wipes the stuck modal with it)
+        // v40/v42: storage VC stuck in the presented chain — dismiss is
+        // failing because the presenting root's view was never loaded
+        // (v41 dump: empty UIDropShadowView; screen black). So: strip the
+        // storage VIEW from the window and force-load the root's real view.
         id presented = [root performSelector:@selector(presentedViewController)];
         while (presented) {
             if (wa_is_storage_vc(presented)) {
-                id good = wa_make_good_root();
-                if (good) {
-                    [w performSelector:@selector(setRootViewController:) withObject:good];
+                id pv = [presented performSelector:@selector(view)];
+                if (pv) {
+                    [pv performSelector:@selector(removeFromSuperview)];
                     wa_marker([NSString stringWithFormat:
-                               @"BYPASS NUKE root (%s) with stuck storage modal -> %s",
-                               class_getName(object_getClass(root)),
-                               class_getName(object_getClass(good))]);
+                               @"BYPASS STRIPPED stuck storage view from %s root",
+                               class_getName(object_getClass(root))]);
+                }
+                // force the root's own view to load + attach
+                if ([root respondsToSelector:@selector(loadViewIfNeeded)]) {
+                    [root performSelector:@selector(loadViewIfNeeded)];
+                } else {
+                    [root performSelector:@selector(view)];
+                }
+                id rv = [root performSelector:@selector(view)];
+                if (rv) {
+                    int n = (int)[(id)[rv performSelector:@selector(subviews)] count];
+                    wa_marker([NSString stringWithFormat:
+                               @"BYPASS root %s view loaded, %d subviews",
+                               class_getName(object_getClass(root)), n]);
                 }
                 break;
             }
@@ -1539,8 +1553,8 @@ static void wa_init(void) {
     // v34: fresh marker per launch (old log storms could reach 68 MB and
     // freeze the main thread; we only need THIS launch's ground truth)
     wa_marker_reset();
-    os_log_info(wa_log(), "waContainerFix v41 constructor running");
-    wa_marker(@"=== waContainerFix v41 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v42 constructor running");
+    wa_marker(@"=== waContainerFix v42 constructor ===");
 
     // v32: low-storage gate bypass — run early and retry (classes may not be
     // loaded yet at constructor time), then dismiss any shown modal later
