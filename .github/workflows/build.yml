@@ -9,7 +9,7 @@ jobs:
         run: |
           xcrun -sdk iphoneos clang -arch arm64 -dynamiclib \
             -miphoneos-version-min=15.0 -fobjc-arc \
-            -framework Foundation fix.m -o libwaContainerFix.dylib
+            -framework Foundation -framework Network fix.m -o libwaContainerFix.dylib
           lipo -info libwaContainerFix.dylib
           file libwaContainerFix.dylib
       - uses: actions/upload-artifact@v4
