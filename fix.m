@@ -755,7 +755,13 @@ static void wa_presentModalVC_block(id self, SEL _cmd, id vc, BOOL animated) {
 }
 
 static void wa_block_storage_presentation(void) {
-    Class uivc = [UIViewController class];
+    // UIViewController is loaded by the time the app runs, but the dylib
+    // itself is Foundation-only — resolve at runtime, never at link time
+    Class uivc = NSClassFromString(@"UIViewController");
+    if (!uivc) {
+        wa_marker(@"BYPASS UIViewController not loaded yet (skip presentation block)");
+        return;
+    }
     if (!orig_presentVC) {
         wa_swizzle_scoped(uivc, @selector(presentViewController:animated:completion:),
                           (IMP)wa_presentVC_block, &orig_presentVC);
