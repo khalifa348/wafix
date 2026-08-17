@@ -940,7 +940,7 @@ static void wa_neutralize_storage_reads(void) {
             IMP cur = class_getMethodImplementation(cls, sel);
             if (cur == (IMP)wa_stub_zero) continue;
             method_setImplementation(methods[j], (IMP)wa_stub_zero);
-            if (neutered < 24) wa_marker(@"NEUTRAL inst %s %s", class_getName(cls), sn);
+            if (neutered < 24) wa_marker([NSString stringWithFormat:@"NEUTRAL inst %s %s", class_getName(cls), sn]);
             neutered++;
         }
         if (methods) free(methods);
@@ -962,13 +962,13 @@ static void wa_neutralize_storage_reads(void) {
             IMP cur = class_getMethodImplementation(meta, sel);
             if (cur == (IMP)wa_stub_zero) continue;
             method_setImplementation(cms[j], (IMP)wa_stub_zero);
-            if (neutered < 24) wa_marker(@"NEUTRAL cls %s %s", class_getName(cls), sn);
+            if (neutered < 24) wa_marker([NSString stringWithFormat:@"NEUTRAL cls %s %s", class_getName(cls), sn]);
             neutered++;
         }
         if (cms) free(cms);
     }
     free(classes);
-    wa_marker(@"NEUTRAL total %d storage reads zeroed", neutered);
+    wa_marker([NSString stringWithFormat:@"NEUTRAL total %d storage reads zeroed", neutered]);
 }
 
 static void wa_block_storage_presentation(void) {
