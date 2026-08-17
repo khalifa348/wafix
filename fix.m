@@ -49,6 +49,7 @@
 #import <objc/message.h>
 #import <fcntl.h>
 #import <unistd.h>
+#import <sys/stat.h>
 
 // forward decl (wa_marker defined later in file)
 static void wa_marker(NSString *line);
@@ -573,6 +574,8 @@ static void wa_bypass_low_storage(void) {
     sels[0] = sel_registerName(selNames[0]);
     sels[1] = sel_registerName(selNames[1]);
     sels[2] = sel_registerName(selNames[2]);
+    // shouldHandleLowStorage returns BOOL (must exist before the loop; v34)
+    SEL sh = sel_registerName("shouldHandleLowStorage");
     int patched = 0;
     int skipped_system = 0;
     for (int i = 0; i < n; i++) {
@@ -589,26 +592,37 @@ static void wa_bypass_low_storage(void) {
             skipped_system++;
             continue;
         }
-        for (int k = 0; k < 3; k++) {
-            Method m = class_getInstanceMethod(cls, sels[k]);
-            if (m && method_getImplementation(m) != (IMP)wa_noop_void
-                 && method_getImplementation(m) != (IMP)wa_noop_void_id) {
-                IMP imp = (k == 2) ? (IMP)wa_noop_void_id : (IMP)wa_noop_void;
-                method_setImplementation(m, imp);
-                wa_marker([NSString stringWithFormat:@"BYPASS patched %s on %s",
-                           selNames[k], class_getName(cls)]);
-                patched++;
+        // v34 FIX: use class_copyMethodList (DIRECT read, no resolution
+        // trigger) instead of class_getInstanceMethod. v33's
+        // class_getInstanceMethod calls triggered the resolveInstanceMethod:
+        // swizzle for EVERY class missing the selector → 500K+ marker writes
+        // on the main thread → black UI for minutes. Direct list read cannot
+        // re-enter the resolver.
+        unsigned int mcount = 0;
+        Method *methods = class_copyMethodList(cls, &mcount);
+        if (!methods) continue;
+        for (unsigned int mi = 0; mi < mcount; mi++) {
+            SEL name = method_getName(methods[mi]);
+            if (name == sels[0] || name == sels[1] || name == sels[2]) {
+                IMP cur = method_getImplementation(methods[mi]);
+                if (cur != (IMP)wa_noop_void && cur != (IMP)wa_noop_void_id) {
+                    IMP imp = (name == sels[2]) ? (IMP)wa_noop_void_id : (IMP)wa_noop_void;
+                    method_setImplementation(methods[mi], imp);
+                    wa_markerOnce([NSString stringWithFormat:@"BYPASS patched %s on %s",
+                                   sel_getName(name), class_getName(cls)]);
+                    patched++;
+                }
+            } else if (name == sh) {
+                IMP cur = method_getImplementation(methods[mi]);
+                if (cur != (IMP)wa_noop_false) {
+                    method_setImplementation(methods[mi], (IMP)wa_noop_false);
+                    wa_markerOnce([NSString stringWithFormat:@"BYPASS patched shouldHandleLowStorage on %s",
+                                   class_getName(cls)]);
+                    patched++;
+                }
             }
         }
-        // shouldHandleLowStorage returns BOOL
-        SEL sh = sel_registerName("shouldHandleLowStorage");
-        Method mh = class_getInstanceMethod(cls, sh);
-        if (mh && method_getImplementation(mh) != (IMP)wa_noop_false) {
-            method_setImplementation(mh, (IMP)wa_noop_false);
-            wa_marker([NSString stringWithFormat:@"BYPASS patched shouldHandleLowStorage on %s",
-                       class_getName(cls)]);
-            patched++;
-        }
+        free(methods);
     }
     free(classes);
     wa_marker([NSString stringWithFormat:@"BYPASS scan done (%d patches, %d system skipped)", patched, skipped_system]);
@@ -679,12 +693,19 @@ static void wa_marker(NSString *line) {
     // "BUG IN CLIENT OF LIBDISPATCH: trying to lock recursively" → abort
     // (crash 154235). open/write/close can never re-enter os_log or
     // CoreServicesInternal, so markers are safe at ANY init stage.
+    // v34: size cap — once the marker exceeds 3 MB, stop writing (guards
+    // against a runaway log storm freezing the main thread).
     const char *home = getenv("HOME");
     if (!home || !home[0]) return;
     char path[1024];
     snprintf(path, sizeof(path), "%s/Documents/wafix_marker.txt", home);
     int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (fd < 0) return;
+    struct stat st;
+    if (fstat(fd, &st) == 0 && st.st_size > 3 * 1024 * 1024) {
+        close(fd);
+        return;
+    }
     const char *s = line.UTF8String;
     if (s) {
         size_t n = strlen(s);
@@ -692,6 +713,16 @@ static void wa_marker(NSString *line) {
         write(fd, "\n", 1);
     }
     close(fd);
+}
+
+// v34: fresh marker per launch (truncate at constructor start)
+static void wa_marker_reset(void) {
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) return;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/Documents/wafix_marker.txt", home);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) close(fd);
 }
 
 // de-dup: only log a (class, selector) combo once per run
@@ -1145,8 +1176,11 @@ static void wa_swizzle_inst(Class cls, SEL sel, IMP imp, IMP *origOut) {
 
 __attribute__((constructor))
 static void wa_init(void) {
-    os_log_info(wa_log(), "waContainerFix v33 constructor running");
-    wa_marker(@"=== waContainerFix v33 constructor ===");
+    // v34: fresh marker per launch (old log storms could reach 68 MB and
+    // freeze the main thread; we only need THIS launch's ground truth)
+    wa_marker_reset();
+    os_log_info(wa_log(), "waContainerFix v34 constructor running");
+    wa_marker(@"=== waContainerFix v34 constructor ===");
 
     // v32: low-storage gate bypass — run early and retry (classes may not be
     // loaded yet at constructor time), then dismiss any shown modal later
