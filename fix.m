@@ -860,6 +860,21 @@ static void wa_presentPrivate_block(id self, SEL _cmd, id vc, id anim, id comple
     ((void (*)(id, SEL, id, id, id))orig)(self, _cmd, vc, anim, completion);
 }
 
+// v41: WAWindow + coordinator classes OVERRIDE setRootViewController: and
+// re-dispatch the selector on self — calling their IMP as "orig" from our
+// block recurses into our own patched IMP forever (v40 crash: EXC_BAD_ACCESS
+// stack overflow in wa_setRootVC_block). Capture UIWindow's TRUE base IMP
+// before any swizzling and always call that instead.
+static IMP wa_base_setRootVC = NULL;
+
+static void wa_capture_base_setRootVC(void) {
+    if (wa_base_setRootVC) return;
+    Class uiwin = NSClassFromString(@"UIWindow");
+    if (!uiwin) return;
+    Method m = class_getInstanceMethod(uiwin, sel_registerName("setRootViewController:"));
+    if (m) wa_base_setRootVC = method_getImplementation(m);
+}
+
 static void wa_setRootVC_block(id self, SEL _cmd, id vc) {
     if (wa_is_storage_vc(vc)) {
         wa_marker([NSString stringWithFormat:@"BYPASS BLOCKED storage-modal setRoot from %s",
@@ -868,12 +883,15 @@ static void wa_setRootVC_block(id self, SEL _cmd, id vc) {
         vc = wa_make_good_root();
         if (!vc) return;
     }
-    IMP orig = wa_orig_pres_imp(object_getClass(self), _cmd);
+    IMP orig = wa_base_setRootVC;
     if (!orig) orig = orig_setRootVC;
     ((void (*)(id, SEL, id))orig)(self, _cmd, vc);
 }
 
 static void wa_block_storage_presentation(void) {
+    // v41: capture UIWindow's TRUE setRootViewController: IMP before any
+    // swizzle replaces it — the per-class originals are unsafe (see above)
+    wa_capture_base_setRootVC();
     // UIViewController is loaded by the time the app runs, but the dylib
     // itself is Foundation-only — resolve at runtime, never at link time
     Class uivc = NSClassFromString(@"UIViewController");
@@ -920,6 +938,18 @@ static void wa_block_storage_presentation(void) {
         if (class_isMetaClass(cls)) continue;
         const char *img = class_getImageName(cls);
         if (!img || !strstr(img, "WhatsApp.app/WhatsApp")) continue;
+        // v41: setRootViewController: overrides on NON-window classes
+        // (coordinators, bottom sheets) re-dispatch the selector on self —
+        // patching them made the app loop forever (v40 crash). Only patch
+        // real UIWindow subclasses; their orig is never called (we always
+        // use the captured UIWindow base IMP instead).
+        BOOL isWindowCls = NO;
+        if (sels[2]) {
+            Class c = cls;
+            Class uiwinCls = NSClassFromString(@"UIWindow");
+            while (c && c != uiwinCls) c = class_getSuperclass(c);
+            isWindowCls = (c == uiwinCls);
+        }
         unsigned int mcount = 0;
         Method *methods = class_copyMethodList(cls, &mcount);
         if (!methods) continue;
@@ -929,7 +959,7 @@ static void wa_block_storage_presentation(void) {
             IMP newImp = NULL;
             if (name == sels[0]) newImp = (IMP)wa_presentVC_block;
             else if (name == sels[1]) newImp = (IMP)wa_presentModalVC_block;
-            else if (name == sels[2]) newImp = (IMP)wa_setRootVC_block;
+            else if (name == sels[2]) { if (isWindowCls) newImp = (IMP)wa_setRootVC_block; }
             else if (name == sels[3]) newImp = (IMP)wa_presentPrivate_block;
             if (!newImp || cur == newImp) continue;
             // save per-class original (first time only)
@@ -1509,8 +1539,8 @@ static void wa_init(void) {
     // v34: fresh marker per launch (old log storms could reach 68 MB and
     // freeze the main thread; we only need THIS launch's ground truth)
     wa_marker_reset();
-    os_log_info(wa_log(), "waContainerFix v40 constructor running");
-    wa_marker(@"=== waContainerFix v40 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v41 constructor running");
+    wa_marker(@"=== waContainerFix v41 constructor ===");
 
     // v32: low-storage gate bypass — run early and retry (classes may not be
     // loaded yet at constructor time), then dismiss any shown modal later
