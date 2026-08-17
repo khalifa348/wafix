@@ -532,8 +532,94 @@ static void wa_drive_run(void) {
             } else {
                 wa_marker([NSString stringWithFormat:@"DRIVE no control matching %@", part]);
             }
+        } else if ([trimmed hasPrefix:@"STATS"]) {
+            // v32: log device storage stats from inside the app
+            NSFileManager *fm = [NSFileManager defaultManager];
+            NSDictionary *attrs = [fm attributesOfFileSystemForPath:NSHomeDirectory()
+                                                              error:nil];
+            long long freeBytes = [attrs[NSFileSystemFreeSize] longLongValue];
+            long long totalBytes = [attrs[NSFileSystemSize] longLongValue];
+            wa_marker([NSString stringWithFormat:@"STATS free=%.1fMB total=%.1fMB",
+                       freeBytes / 1048576.0, totalBytes / 1048576.0]);
         } else {
             wa_marker([NSString stringWithFormat:@"DRIVE unknown cmd: %@", trimmed]);
+        }
+    }
+}
+
+// ---------- v32: low-storage gate bypass ----------
+// WhatsApp blocks at a "Storage is full" screen when the device is low on
+// space, before any UI/network work. Neutralize the gate so the app reaches
+// the welcome screen. The gate selectors (from binary string scan):
+//   -presentLowStorageModalIfNeededFromParent:
+//   -showLowStorageModalIfNeeded
+//   -shouldHandleLowStorage
+//   -criticallyLowStorageDidOccur:
+static void wa_noop_void_id(id self, SEL _cmd, id arg) { (void)self; (void)_cmd; (void)arg; }
+static void wa_noop_void(id self, SEL _cmd) { (void)self; (void)_cmd; }
+static BOOL wa_noop_false(id self, SEL _cmd) { (void)self; (void)_cmd; return NO; }
+
+static void wa_bypass_low_storage(void) {
+    int n = objc_getClassList(NULL, 0);
+    if (n <= 0) return;
+    Class *classes = malloc(sizeof(Class) * n);
+    n = objc_getClassList(classes, n);
+    const char *selNames[] = {
+        "presentLowStorageModalIfNeededFromParent:",
+        "showLowStorageModalIfNeeded",
+        "criticallyLowStorageDidOccur:",
+    };
+    SEL sels[3];
+    sels[0] = sel_registerName(selNames[0]);
+    sels[1] = sel_registerName(selNames[1]);
+    sels[2] = sel_registerName(selNames[2]);
+    int patched = 0;
+    for (int i = 0; i < n; i++) {
+        Class cls = classes[i];
+        if (class_isMetaClass(cls)) continue;
+        for (int k = 0; k < 3; k++) {
+            Method m = class_getInstanceMethod(cls, sels[k]);
+            if (m && method_getImplementation(m) != (IMP)wa_noop_void_id) {
+                IMP imp = (k == 2) ? (IMP)wa_noop_void_id : (IMP)wa_noop_void;
+                method_setImplementation(m, imp);
+                wa_marker([NSString stringWithFormat:@"BYPASS patched %s on %s",
+                           selNames[k], class_getName(cls)]);
+                patched++;
+            }
+        }
+        // shouldHandleLowStorage returns BOOL
+        SEL sh = sel_registerName("shouldHandleLowStorage");
+        Method mh = class_getInstanceMethod(cls, sh);
+        if (mh && method_getImplementation(mh) != (IMP)wa_noop_false) {
+            method_setImplementation(mh, (IMP)wa_noop_false);
+            wa_marker([NSString stringWithFormat:@"BYPASS patched shouldHandleLowStorage on %s",
+                       class_getName(cls)]);
+            patched++;
+        }
+    }
+    free(classes);
+    wa_marker([NSString stringWithFormat:@"BYPASS scan done (%d patches)", patched]);
+}
+
+// Dismiss any presented low-storage / storage-warning modal so the app
+// proceeds even if the gate fired before we patched it.
+static void wa_dismiss_storage_modal(void) {
+    id app = [(id)NSClassFromString(@"UIApplication") performSelector:@selector(sharedApplication)];
+    if (!app) return;
+    id windows = [app performSelector:@selector(windows)];
+    for (id w in windows) {
+        id root = [w performSelector:@selector(rootViewController)];
+        id vc = root;
+        id presented = [vc performSelector:@selector(presentedViewController)];
+        while (presented) {
+            NSString *cn = NSStringFromClass(object_getClass(presented));
+            if ([cn containsString:@"LowStorage"] || [cn containsString:@"StorageWarning"]) {
+                wa_marker([NSString stringWithFormat:@"BYPASS dismissing %@", cn]);
+                [presented performSelector:@selector(dismissViewControllerAnimated:completion:)
+                                withObject:@NO withObject:nil];
+            }
+            vc = presented;
+            presented = [vc performSelector:@selector(presentedViewController)];
         }
     }
 }
@@ -1046,11 +1132,25 @@ static void wa_swizzle_inst(Class cls, SEL sel, IMP imp, IMP *origOut) {
 
 __attribute__((constructor))
 static void wa_init(void) {
-    os_log_info(wa_log(), "waContainerFix v31 constructor running");
-    wa_marker(@"=== waContainerFix v31 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v32 constructor running");
+    wa_marker(@"=== waContainerFix v32 constructor ===");
+
+    // v32: low-storage gate bypass — run early and retry (classes may not be
+    // loaded yet at constructor time), then dismiss any shown modal later
+    wa_bypass_low_storage();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        wa_bypass_low_storage();
+        wa_dismiss_storage_modal();
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        wa_bypass_low_storage();
+        wa_dismiss_storage_modal();
+    });
 
     // v31: schedule the in-app UI driver (registration drive) — reads
-    // Documents/wafix_drive.txt at +8s (DUMP/TYPE/TAP commands)
+    // Documents/wafix_drive.txt at +8s (DUMP/TYPE/TAP/STATS commands)
     wa_drive_schedule();
 
     // v10/v11: anti-tamper evasion — init dyld interpose reals FIRST so the
