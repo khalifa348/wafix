@@ -263,6 +263,39 @@ static int wa_fake_getaddrinfo(const char *node, const char *service,
 
 WA_INTERPOSE(wa_fake_getaddrinfo, getaddrinfo)
 
+// ---------- v28: NWConnection endpoint redirect (tb3b) ----------
+// v18 hook getaddrinfo NEVER FIRES on iOS 26: the app resolves chat hosts
+// via Network.framework (nw_endpoint_create_host), whose DNS resolution
+// happens daemon-side (mDNSResponder) — libc getaddrinfo is not called at
+// all (marker had ZERO "REDIRECT cfg loaded" lines even though that line
+// writes on the FIRST getaddrinfo of any kind).
+// v28 interposes nw_endpoint_create_host: EVERY NWConnection created from a
+// hostname flows through this function. When the redirect file is present
+// and the host is a chat host, rewrite to the PC IP:port.
+typedef NSObject *nw_endpoint_t;  // opaque OS_OBJECT — pointer-only use
+
+static nw_endpoint_t (*wa_real_nw_endpoint_create_host)(const char *, const char *);
+
+static nw_endpoint_t wa_fake_nw_endpoint_create_host(const char *hostname, const char *port) {
+    if (!wa_real_nw_endpoint_create_host) {
+        // RTLD_NEXT from our image finds the real one in Network.framework
+        // (the app links it, so it is loaded by the time any NWConnection
+        // is created). Avoids adding -framework Network to the CI build.
+        wa_real_nw_endpoint_create_host = dlsym(RTLD_NEXT, "nw_endpoint_create_host");
+        if (!wa_real_nw_endpoint_create_host) return nil;  // cannot happen in practice
+    }
+    wa_redirect_load();
+    if (g_redirect_port != 0 && hostname && wa_isChatHost(hostname)) {
+        char portbuf[16];
+        snprintf(portbuf, sizeof(portbuf), "%d", g_redirect_port);
+        wa_marker([NSString stringWithFormat:@"REDIRECT nw %s:%s → %s:%s",
+                   hostname, port ? port : "?", g_redirect_ip, portbuf]);
+        return wa_real_nw_endpoint_create_host(g_redirect_ip, portbuf);
+    }
+    return wa_real_nw_endpoint_create_host(hostname, port);
+}
+WA_INTERPOSE(wa_fake_nw_endpoint_create_host, nw_endpoint_create_host)
+
 static os_log_t wa_log(void) {
     static os_log_t l;
     static dispatch_once_t once;
@@ -764,8 +797,8 @@ static void wa_swizzle_inst(Class cls, SEL sel, IMP imp, IMP *origOut) {
 
 __attribute__((constructor))
 static void wa_init(void) {
-    os_log_info(wa_log(), "waContainerFix v27 constructor running");
-    wa_marker(@"=== waContainerFix v27 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v28 constructor running");
+    wa_marker(@"=== waContainerFix v28 constructor ===");
 
     // v10/v11: anti-tamper evasion — init dyld interpose reals FIRST so the
     // fakes are correct before any swizzle/launch activity
