@@ -705,53 +705,84 @@ static void wa_kill_storage_on_appear(void) {
     }
 }
 
-// ---------- v37: block the storage-screen PRESENTATION at the source ----------
+// ---------- v37/v38: block the storage-screen PRESENTATION at the source ----------
 // v36 proved the app RE-PRESENTS the storage modal instantly after every
 // dismissal (marker shows a dismissal loop while the screen stays up). The
 // re-presenter is some path we haven't nopped yet. Instead of chasing it,
 // nullify the presentation call itself: any -presentViewController: whose
 // incoming VC is a storage VC (directly or nav-wrapped) is swallowed, and we
 // log WHO tried to present it so the marker names the source.
-static IMP orig_presentVC = NULL;
-static void wa_presentVC_block(id self, SEL _cmd, id vc, BOOL animated, id completion) {
-    BOOL bad = NO;
-    if (vc) {
-        id target = vc;
-        if ([target isKindOfClass:NSClassFromString(@"UINavigationController")]) {
-            id top = [target performSelector:@selector(topViewController)];
-            if (top) target = top;
-        }
-        Class c1 = NSClassFromString(@"WACriticallyLowStorageViewController");
-        Class c2 = NSClassFromString(@"WAStorageWarningViewController");
-        if ((c1 && [target isKindOfClass:c1]) || (c2 && [target isKindOfClass:c2])) {
-            bad = YES;
-        }
+//
+// v38 FIX: v37 blocked only UIViewController's own implementation, but the
+// DUMP showed the modal container still appears with ZERO "BLOCKED" marker
+// lines — the presenter goes through a SUBCLASS OVERRIDE of
+// presentViewController:/setRootViewController: (WA's own VC classes),
+// which bypasses a UIViewController-level swizzle. So v38 patches every
+// WhatsApp class that IMPLEMENTS these selectors (per-class originals kept
+// so normal presentations still work), plus zeroes the exported global
+// _WACriticallyLowSpaceDidOccur flag via dlsym.
+
+static BOOL wa_is_storage_vc(id vc) {
+    if (!vc) return NO;
+    id target = vc;
+    Class navCls = NSClassFromString(@"UINavigationController");
+    if (navCls && [target isKindOfClass:navCls]) {
+        id top = [target performSelector:@selector(topViewController)];
+        if (top) target = top;
     }
-    if (bad) {
+    Class c1 = NSClassFromString(@"WACriticallyLowStorageViewController");
+    Class c2 = NSClassFromString(@"WAStorageWarningViewController");
+    return ((c1 && [target isKindOfClass:c1]) || (c2 && [target isKindOfClass:c2]));
+}
+
+// per-class original IMPs for the patched presentation selectors
+typedef struct wa_orig_pres { Class cls; SEL sel; IMP imp; struct wa_orig_pres *next; } wa_orig_pres_t;
+static wa_orig_pres_t *g_orig_pres = NULL;
+
+static IMP wa_orig_pres_imp(Class cls, SEL sel) {
+    for (wa_orig_pres_t *p = g_orig_pres; p; p = p->next)
+        if (p->cls == cls && p->sel == sel) return p->imp;
+    return NULL;
+}
+
+static IMP orig_presentVC = NULL;      // UIViewController's own original (fallback)
+static IMP orig_setRootVC = NULL;      // UIWindow's own original (fallback)
+
+static void wa_presentVC_block(id self, SEL _cmd, id vc, BOOL animated, id completion) {
+    if (wa_is_storage_vc(vc)) {
         wa_marker([NSString stringWithFormat:@"BYPASS BLOCKED storage-modal present from %s",
                    class_getName(object_getClass(self))]);
         if (completion) ((void (^)(void))completion)();
         return;
     }
-    ((void (*)(id, SEL, id, BOOL, id))orig_presentVC)(self, _cmd, vc, animated, completion);
+    IMP orig = wa_orig_pres_imp(object_getClass(self), _cmd);
+    if (!orig) orig = orig_presentVC;
+    ((void (*)(id, SEL, id, BOOL, id))orig)(self, _cmd, vc, animated, completion);
 }
 
-static IMP orig_presentModalVC = NULL;
 static void wa_presentModalVC_block(id self, SEL _cmd, id vc, BOOL animated) {
-    BOOL bad = NO;
-    if (vc) {
-        Class c1 = NSClassFromString(@"WACriticallyLowStorageViewController");
-        Class c2 = NSClassFromString(@"WAStorageWarningViewController");
-        if ((c1 && [vc isKindOfClass:c1]) || (c2 && [vc isKindOfClass:c2])) {
-            bad = YES;
-        }
-    }
-    if (bad) {
+    if (wa_is_storage_vc(vc)) {
         wa_marker([NSString stringWithFormat:@"BYPASS BLOCKED storage-modal presentModal from %s",
                    class_getName(object_getClass(self))]);
         return;
     }
-    ((void (*)(id, SEL, id, BOOL))orig_presentModalVC)(self, _cmd, vc, animated);
+    IMP orig = wa_orig_pres_imp(object_getClass(self), _cmd);
+    if (!orig) orig = orig_presentVC;
+    ((void (*)(id, SEL, id, BOOL))orig)(self, _cmd, vc, animated);
+}
+
+static void wa_setRootVC_block(id self, SEL _cmd, id vc) {
+    if (wa_is_storage_vc(vc)) {
+        wa_marker([NSString stringWithFormat:@"BYPASS BLOCKED storage-modal setRoot from %s",
+                   class_getName(object_getClass(self))]);
+        // give the window a blank root so the app's state machine can move on
+        Class blank = NSClassFromString(@"UIViewController");
+        if (blank) vc = [blank new];
+        else return;
+    }
+    IMP orig = wa_orig_pres_imp(object_getClass(self), _cmd);
+    if (!orig) orig = orig_setRootVC;
+    ((void (*)(id, SEL, id))orig)(self, _cmd, vc);
 }
 
 static void wa_block_storage_presentation(void) {
@@ -762,15 +793,74 @@ static void wa_block_storage_presentation(void) {
         wa_marker(@"BYPASS UIViewController not loaded yet (skip presentation block)");
         return;
     }
+    // v37 baseline: UIViewController's own implementation
     if (!orig_presentVC) {
         wa_swizzle_scoped(uivc, @selector(presentViewController:animated:completion:),
                           (IMP)wa_presentVC_block, &orig_presentVC);
         wa_marker(@"BYPASS presentViewController: blocked for storage VCs");
     }
-    if (!orig_presentModalVC) {
-        wa_swizzle_scoped(uivc, @selector(presentModalViewController:animated:),
-                          (IMP)wa_presentModalVC_block, &orig_presentModalVC);
-        wa_marker(@"BYPASS presentModalViewController: blocked for storage VCs");
+    Class uiw = NSClassFromString(@"UIWindow");
+    if (uiw && !orig_setRootVC) {
+        wa_swizzle_scoped(uiw, @selector(setRootViewController:),
+                          (IMP)wa_setRootVC_block, &orig_setRootVC);
+        wa_marker(@"BYPASS setRootViewController: blocked for storage VCs");
+    }
+    // v38: patch EVERY WhatsApp class that implements these selectors — a
+    // subclass override bypasses the UIViewController-level swizzle
+    const char *selNames[] = {
+        "presentViewController:animated:completion:",
+        "presentModalViewController:animated:",
+        "setRootViewController:",
+    };
+    SEL sels[3] = {
+        sel_registerName(selNames[0]),
+        sel_registerName(selNames[1]),
+        sel_registerName(selNames[2]),
+    };
+    int n = objc_getClassList(NULL, 0);
+    if (n <= 0) return;
+    Class *classes = (Class *)malloc(sizeof(Class) * n);
+    n = objc_getClassList(classes, n);
+    for (int i = 0; i < n; i++) {
+        Class cls = classes[i];
+        if (class_isMetaClass(cls)) continue;
+        const char *img = class_getImageName(cls);
+        if (!img || !strstr(img, "WhatsApp.app/WhatsApp")) continue;
+        unsigned int mcount = 0;
+        Method *methods = class_copyMethodList(cls, &mcount);
+        if (!methods) continue;
+        for (unsigned int mi = 0; mi < mcount; mi++) {
+            SEL name = method_getName(methods[mi]);
+            IMP cur = method_getImplementation(methods[mi]);
+            IMP newImp = NULL;
+            if (name == sels[0]) newImp = (IMP)wa_presentVC_block;
+            else if (name == sels[1]) newImp = (IMP)wa_presentModalVC_block;
+            else if (name == sels[2]) newImp = (IMP)wa_setRootVC_block;
+            if (!newImp || cur == newImp) continue;
+            // save per-class original (first time only)
+            BOOL have = NO;
+            for (wa_orig_pres_t *p = g_orig_pres; p; p = p->next)
+                if (p->cls == cls && p->sel == name) { have = YES; break; }
+            if (!have) {
+                wa_orig_pres_t *p = (wa_orig_pres_t *)calloc(1, sizeof(wa_orig_pres_t));
+                p->cls = cls; p->sel = name; p->imp = cur;
+                p->next = g_orig_pres;
+                g_orig_pres = p;
+            }
+            method_setImplementation(methods[mi], newImp);
+            wa_markerOnce([NSString stringWithFormat:@"BYPASS patched %s on %s (present-block)",
+                           sel_getName(name), class_getName(cls)]);
+        }
+        free(methods);
+    }
+    free(classes);
+    // v38: zero the exported low-space flag if it exists
+    void *flag = dlsym(RTLD_DEFAULT, "_WACriticallyLowSpaceDidOccur");
+    if (flag) {
+        *(unsigned char *)flag = 0;
+        wa_marker(@"BYPASS zeroed _WACriticallyLowSpaceDidOccur global");
+    } else {
+        wa_marker(@"BYPASS _WACriticallyLowSpaceDidOccur not exported (dlsym NULL)");
     }
 }
 
@@ -1324,8 +1414,8 @@ static void wa_init(void) {
     // v34: fresh marker per launch (old log storms could reach 68 MB and
     // freeze the main thread; we only need THIS launch's ground truth)
     wa_marker_reset();
-    os_log_info(wa_log(), "waContainerFix v37 constructor running");
-    wa_marker(@"=== waContainerFix v37 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v38 constructor running");
+    wa_marker(@"=== waContainerFix v38 constructor ===");
 
     // v32: low-storage gate bypass — run early and retry (classes may not be
     // loaded yet at constructor time), then dismiss any shown modal later
