@@ -312,6 +312,101 @@ static nw_endpoint_t wa_fake_nw_endpoint_create_host(const char *hostname, const
 }
 WA_INTERPOSE(wa_fake_nw_endpoint_create_host, nw_endpoint_create_host)
 
+// ---------- v30: nw_connection_create + connect() hooks ----------
+// WHY v30: v28/v29 interposed nw_endpoint_create_host, but the MAIN BINARY
+// imports only 4 nw_* symbols — nw_connection_create, nw_connection_start,
+// nw_connection_send, nw_connection_receive (+ _nw_connection_cancel,
+// _nw_connection_set_queue) — NOT nw_endpoint_create_host. Zero NW-ENDPOINT
+// lines across the v28+v29 marker segments ⇒ the app never calls it
+// (endpoints come from a different layer/path). v30 hooks:
+//   * nw_connection_create — EVERY NWConnection, host- OR address-based
+//   * connect() — the raw BSD socket path (PJSIP pj_sock_* layer)
+// nw_connection_create redirects when the endpoint's hostname is a chat host
+// and the redirect file is present; connect() logs destinations (diag only).
+typedef NSObject *nw_parameters_t;  // opaque OS_OBJECT — pointer-only use
+
+extern nw_endpoint_t nw_connection_create(nw_endpoint_t endpoint, nw_parameters_t parameters);
+extern const char *nw_endpoint_get_hostname(nw_endpoint_t endpoint);
+extern uint16_t nw_endpoint_get_port(nw_endpoint_t endpoint);
+
+static nw_endpoint_t (*wa_real_nw_connection_create)(nw_endpoint_t, nw_parameters_t);
+
+static nw_endpoint_t wa_fake_nw_connection_create(nw_endpoint_t endpoint, nw_parameters_t parameters) {
+    if (!wa_real_nw_connection_create) {
+        wa_real_nw_connection_create = dlsym(RTLD_NEXT, "nw_connection_create");
+        if (!wa_real_nw_connection_create) return nil;
+    }
+    // read the endpoint's hostname if it has one (host-based endpoints only;
+    // address-based endpoints return NULL)
+    const char *host = nw_endpoint_get_hostname ? nw_endpoint_get_hostname(endpoint) : NULL;
+    uint16_t eport = nw_endpoint_get_port ? nw_endpoint_get_port(endpoint) : 0;
+    wa_redirect_load();
+    if (host && wa_isChatHost(host)) {
+        if (g_redirect_port != 0) {
+            char portbuf[16];
+            snprintf(portbuf, sizeof(portbuf), "%d", g_redirect_port);
+            wa_marker([NSString stringWithFormat:@"REDIRECT conn %s:%u → %s:%s",
+                       host, eport, g_redirect_ip, portbuf]);
+            // rebuild the endpoint onto the PC IP:port, keep parameters
+            nw_endpoint_t ne = nw_endpoint_create_host(g_redirect_ip, portbuf);
+            if (ne) return wa_real_nw_connection_create(ne, parameters);
+        }
+        wa_marker([NSString stringWithFormat:@"NW-CONN chathost %s:%u (no cfg → passthrough)",
+                   host, eport]);
+    } else if (host) {
+        wa_marker([NSString stringWithFormat:@"NW-CONN %s:%u (non-chat)", host, eport]);
+    } else {
+        wa_marker(@"NW-CONN (address-based endpoint)");
+    }
+    return wa_real_nw_connection_create(endpoint, parameters);
+}
+WA_INTERPOSE(wa_fake_nw_connection_create, nw_connection_create)
+
+// connect() — raw BSD socket path (PJSIP socket layer). Diagnostic: log
+// every outbound TCP connect destination so we can see whether the chat
+// socket goes through raw sockets instead of Network.framework.
+static int (*wa_real_connect)(int, const struct sockaddr *, socklen_t);
+
+// dedupe: keep at most N unique (ip:port) destinations logged
+#define WA_CONNECT_LOG_MAX 40
+static char g_connect_seen[WA_CONNECT_LOG_MAX][48];
+static int g_connect_seen_n = 0;
+
+static int wa_fake_connect(int fd, const struct sockaddr *addr, socklen_t len) {
+    if (!wa_real_connect) {
+        wa_real_connect = dlsym(RTLD_NEXT, "connect");
+        if (!wa_real_connect) return connect(fd, addr, len);
+    }
+    if (addr && (addr->sa_family == AF_INET || addr->sa_family == AF_INET6)) {
+        char ipbuf[INET6_ADDRSTRLEN] = {0};
+        int port = 0;
+        if (addr->sa_family == AF_INET) {
+            const struct sockaddr_in *sin = (const struct sockaddr_in *)addr;
+            inet_ntop(AF_INET, &sin->sin_addr, ipbuf, sizeof(ipbuf));
+            port = ntohs(sin->sin_port);
+        } else {
+            const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)addr;
+            inet_ntop(AF_INET6, &sin6->sin6_addr, ipbuf, sizeof(ipbuf));
+            port = ntohs(sin6->sin6_port);
+        }
+        if (port != 0 && ipbuf[0]) {
+            char line[64];
+            snprintf(line, sizeof(line), "%s:%d", ipbuf, port);
+            int seen = 0;
+            for (int i = 0; i < g_connect_seen_n; i++) {
+                if (strcmp(g_connect_seen[i], line) == 0) { seen = 1; break; }
+            }
+            if (!seen && g_connect_seen_n < WA_CONNECT_LOG_MAX) {
+                strncpy(g_connect_seen[g_connect_seen_n], line, sizeof(g_connect_seen[g_connect_seen_n]) - 1);
+                g_connect_seen_n++;
+                wa_marker([NSString stringWithFormat:@"CONNECT %s", line]);
+            }
+        }
+    }
+    return wa_real_connect(fd, addr, len);
+}
+WA_INTERPOSE(wa_fake_connect, connect)
+
 static os_log_t wa_log(void) {
     static os_log_t l;
     static dispatch_once_t once;
@@ -813,8 +908,8 @@ static void wa_swizzle_inst(Class cls, SEL sel, IMP imp, IMP *origOut) {
 
 __attribute__((constructor))
 static void wa_init(void) {
-    os_log_info(wa_log(), "waContainerFix v29 constructor running");
-    wa_marker(@"=== waContainerFix v29 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v30 constructor running");
+    wa_marker(@"=== waContainerFix v30 constructor ===");
 
     // v10/v11: anti-tamper evasion — init dyld interpose reals FIRST so the
     // fakes are correct before any swizzle/launch activity
