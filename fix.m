@@ -45,6 +45,8 @@
 #import <netdb.h>
 #import <arpa/inet.h>
 #import <netinet/in.h>
+#import <CoreGraphics/CoreGraphics.h>
+#import <objc/message.h>
 #import <fcntl.h>
 #import <unistd.h>
 
@@ -406,6 +408,142 @@ static int wa_fake_connect(int fd, const struct sockaddr *addr, socklen_t len) {
     return wa_real_connect(fd, addr, len);
 }
 WA_INTERPOSE(wa_fake_connect, connect)
+
+// ---------- v31: in-app UI driver (registration drive) ----------
+// The app is network-idle at the welcome screen — no connection exists to
+// redirect until registration advances. dvt accessibility needs root
+// tunneld (blocked), screenshots render black (failret), so drive the UI
+// from INSIDE the process via a command file:
+//   Documents/wafix_drive.txt, one command per line, read once at +8s:
+//     DUMP            → log view hierarchy (class, frame, text, label)
+//     TYPE <digits>   → focus first UITextField + insertText (real typing)
+//     TAP <classpart> → sendActionsForControlEvents:TouchUpInside on the
+//                       first UIControl whose class name contains classpart
+//   No file / empty → no UI action; app behaves normally.
+// All UIKit access via performSelector/NSInvocation — the CI build links
+// only Foundation+Network, so no compile-time UIKit symbols.
+
+static void wa_drive_log_view(id view, int depth) {
+    if (!view || depth > 10) return;
+    @autoreleasepool {
+        NSString *cls = NSStringFromClass(object_getClass(view));
+        // frame via NSInvocation (struct return)
+        CGRect fr = CGRectZero;
+        SEL frameSel = NSSelectorFromString(@"frame");
+        if ([view respondsToSelector:frameSel]) {
+            NSMethodSignature *sig = [view methodSignatureForSelector:frameSel];
+            if (sig) {
+                NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+                inv.target = view;
+                inv.selector = frameSel;
+                [inv invoke];
+                [inv getReturnValue:&fr];
+            }
+        }
+        NSString *extra = @"";
+        if ([view isKindOfClass:NSClassFromString(@"UITextField")]) {
+            id txt = [view performSelector:NSSelectorFromString(@"text")];
+            if (txt) extra = [NSString stringWithFormat:@" text=\"%@\"", txt];
+        }
+        id al = [view respondsToSelector:NSSelectorFromString(@"accessibilityLabel")]
+                ? [view performSelector:NSSelectorFromString(@"accessibilityLabel")] : nil;
+        if (al) extra = [extra stringByAppendingFormat:@" label=\"%@\"", al];
+        wa_marker([NSString stringWithFormat:@"UI %*s%@ f=%.0f,%.0f %.0fx%.0f%@",
+                   depth * 2, "", cls, fr.origin.x, fr.origin.y, fr.size.width, fr.size.height, extra]);
+        id subs = [view respondsToSelector:NSSelectorFromString(@"subviews")]
+                  ? [view performSelector:NSSelectorFromString(@"subviews")] : nil;
+        for (id sv in subs) wa_drive_log_view(sv, depth + 1);
+    }
+}
+
+static void wa_drive_run(void) {
+    NSString *cfg = [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
+                     stringByAppendingPathComponent:@"wafix_drive.txt"];
+    NSString *s = [NSString stringWithContentsOfFile:cfg encoding:NSUTF8StringEncoding error:NULL];
+    if (!s) return;
+    NSArray *lines = [s componentsSeparatedByString:@"\n"];
+    wa_marker([NSString stringWithFormat:@"DRIVE cfg: %@", s]);
+    id app = [(id)NSClassFromString(@"UIApplication") performSelector:NSSelectorFromString(@"sharedApplication")];
+    if (!app) { wa_marker(@"DRIVE no UIApplication"); return; }
+    id windows = [app respondsToSelector:NSSelectorFromString(@"windows")]
+                 ? [app performSelector:NSSelectorFromString(@"windows")] : nil;
+    if (!windows) { wa_marker(@"DRIVE no windows"); return; }
+    NSArray *cmds = [lines filteredArrayUsingPredicate:
+                     [NSPredicate predicateWithFormat:@"length > 0"]];
+    for (NSString *cmd in cmds) {
+        NSString *trimmed = [cmd stringByTrimmingCharactersInSet:
+                             [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if ([trimmed hasPrefix:@"DUMP"]) {
+            for (id w in windows) wa_drive_log_view(w, 0);
+        } else if ([trimmed hasPrefix:@"TYPE "]) {
+            NSString *digits = [trimmed substringFromIndex:5];
+            // find the first visible UITextField in any window
+            id field = nil;
+            for (id w in windows) {
+                // walk subviews recursively looking for UITextField
+                __block id found = nil;
+                void (^walk)(id) = ^(id v) {
+                    if (found) return;
+                    if ([v isKindOfClass:NSClassFromString(@"UITextField")]) { found = v; return; }
+                    id subs = [v respondsToSelector:NSSelectorFromString(@"subviews")]
+                              ? [v performSelector:NSSelectorFromString(@"subviews")] : nil;
+                    for (id sv in subs) walk(sv);
+                };
+                walk(w);
+                if (found) { field = found; break; }
+            }
+            if (field) {
+                [field performSelector:NSSelectorFromString(@"becomeFirstResponder")];
+                wa_marker([NSString stringWithFormat:@"DRIVE typing %@ into %@",
+                           digits, NSStringFromClass(object_getClass(field))]);
+                // insertText: goes through the real UITextInput pipeline
+                [field performSelector:NSSelectorFromString(@"insertText:") withObject:digits];
+                id txt = [field performSelector:NSSelectorFromString(@"text")];
+                wa_marker([NSString stringWithFormat:@"DRIVE field now: %@", txt]);
+            } else {
+                wa_marker(@"DRIVE no UITextField found");
+            }
+        } else if ([trimmed hasPrefix:@"TAP "]) {
+            NSString *part = [trimmed substringFromIndex:4];
+            id ctrl = nil;
+            for (id w in windows) {
+                __block id found = nil;
+                void (^walk)(id) = ^(id v) {
+                    if (found) return;
+                    NSString *cn = NSStringFromClass(object_getClass(v));
+                    if ([cn rangeOfString:part].location != NSNotFound &&
+                        [v respondsToSelector:NSSelectorFromString(@"sendActionsForControlEvents:")]) {
+                        found = v; return;
+                    }
+                    id subs = [v respondsToSelector:NSSelectorFromString(@"subviews")]
+                              ? [v performSelector:NSSelectorFromString(@"subviews")] : nil;
+                    for (id sv in subs) walk(sv);
+                };
+                walk(w);
+                if (found) { ctrl = found; break; }
+            }
+            if (ctrl) {
+                wa_marker([NSString stringWithFormat:@"DRIVE tapping %@ (%@)",
+                           NSStringFromClass(object_getClass(ctrl)), part]);
+                // UIControlEventTouchUpInside == 1 << 6 — performSelector can't
+                // take integers, so call through objc_msgSend instead
+                ((void (*)(id, SEL, unsigned long))objc_msgSend)(
+                    ctrl, NSSelectorFromString(@"sendActionsForControlEvents:"), 1UL << 6);
+            } else {
+                wa_marker([NSString stringWithFormat:@"DRIVE no control matching %@", part]);
+            }
+        } else {
+            wa_marker([NSString stringWithFormat:@"DRIVE unknown cmd: %@", trimmed]);
+        }
+    }
+}
+
+static void wa_drive_schedule(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        wa_drive_run();
+    });
+}
 
 static os_log_t wa_log(void) {
     static os_log_t l;
@@ -908,8 +1046,12 @@ static void wa_swizzle_inst(Class cls, SEL sel, IMP imp, IMP *origOut) {
 
 __attribute__((constructor))
 static void wa_init(void) {
-    os_log_info(wa_log(), "waContainerFix v30 constructor running");
-    wa_marker(@"=== waContainerFix v30 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v31 constructor running");
+    wa_marker(@"=== waContainerFix v31 constructor ===");
+
+    // v31: schedule the in-app UI driver (registration drive) — reads
+    // Documents/wafix_drive.txt at +8s (DUMP/TYPE/TAP commands)
+    wa_drive_schedule();
 
     // v10/v11: anti-tamper evasion — init dyld interpose reals FIRST so the
     // fakes are correct before any swizzle/launch activity
