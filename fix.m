@@ -76,8 +76,14 @@ static void wa_antiDetectInit(void) {
     // the imported symbol DIRECTLY — dyld resolves our own imports to the
     // REAL libdyld functions (it never self-interposes the interposer).
     g_realsInited = 1;
-    // our own header via dladdr on our code (direct call = real dladdr)
+    // v51: NO Foundation here, EVER. This function runs inside the dyld
+    // interpose fakes, which fire DURING dyld load. [NSString stringWithFormat:]
+    // there can block on the objc runtime lock when the loader thread holds
+    // it -> launch stalls of 3.5-13+ minutes (observed 10699/10711/10717).
+    // Pure POSIX only: dladdr + _dyld_image_count + raw open/write (the v19
+    // lesson: open/write can never re-enter os_log/CoreServicesInternal).
     Dl_info info;
+    char buf[160];
     if (dladdr((const void *)&wa_antiDetectInit, &info)) {
         g_ourHeader = info.dli_fbase;
     }
@@ -87,10 +93,21 @@ static void wa_antiDetectInit(void) {
         for (uint32_t i = 0; i < n; i++) {
             if (_dyld_get_image_header(i) == g_ourHeader) { g_ourIndex = i; break; }
         }
-        wa_marker([NSString stringWithFormat:@"antiDetect: ourHeader=%p ourIndex=%u count=%u",
-                   g_ourHeader, g_ourIndex, n]);
+        snprintf(buf, sizeof(buf), "antiDetect: ourHeader=%p ourIndex=%u count=%u",
+                 g_ourHeader, g_ourIndex, n);
     } else {
-        wa_marker(@"antiDetect: ourHeader=NULL (dladdr failed)");
+        snprintf(buf, sizeof(buf), "antiDetect: ourHeader=NULL (dladdr failed)");
+    }
+    const char *home = getenv("HOME");
+    if (home && home[0]) {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/Documents/wafix_marker.txt", home);
+        int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) {
+            write(fd, buf, strlen(buf));
+            write(fd, "\n", 1);
+            close(fd);
+        }
     }
 }
 
