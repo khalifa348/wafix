@@ -1554,11 +1554,17 @@ static void wa_swizzle_scoped(Class cls, SEL sel, IMP imp, IMP *origOut) {
 // v43: image-load callback — fires once per image as dyld loads it.
 // When UIKitCore loads, UIViewController/UIWindow exist and we can
 // install the presentation block BEFORE the app's own launch code runs.
-static void wa_on_image_load(const char *path) {
-    if (!path) return;
-    if (strstr(path, "UIKitCore") || strstr(path, "/UIKit")) {
-        wa_marker(@"BYPASS UIKitCore loaded — early presentation block");
-        wa_block_storage_presentation();
+static void wa_on_image_load(const struct mach_header *mh) {
+    (void)mh;
+    uint32_t c = _dyld_image_count();
+    for (uint32_t i = 0; i < c; i++) {
+        const char *path = _dyld_get_image_name(i);
+        if (!path) continue;
+        if (strstr(path, "UIKitCore") || strstr(path, "/UIKit")) {
+            wa_marker(@"BYPASS UIKitCore loaded — early presentation block");
+            wa_block_storage_presentation();
+            return;
+        }
     }
 }
 
