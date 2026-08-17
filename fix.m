@@ -502,6 +502,14 @@ static void wa_drive_run(void) {
                         wa_marker([NSString stringWithFormat:@"  GATE  -%s", sel_getName(method_getName(mets[mj]))]);
                     }
                     if (mets) free(mets);
+                    // v47: class methods too (WALowStorageAlerts API is class-level)
+                    Class meta = object_getClass(g);
+                    unsigned int mcc = 0;
+                    Method *cms = class_copyMethodList(meta, &mcc);
+                    for (unsigned int mj = 0; mj < mcc && mj < 40; mj++) {
+                        wa_marker([NSString stringWithFormat:@"  GATE+ +%s", sel_getName(method_getName(cms[mj]))]);
+                    }
+                    if (cms) free(cms);
                 }
             }
             // v40: log root class + presented chain per window (diagnosis)
@@ -1682,8 +1690,8 @@ static void wa_init(void) {
     // v34: fresh marker per launch (old log storms could reach 68 MB and
     // freeze the main thread; we only need THIS launch's ground truth)
     wa_marker_reset();
-    os_log_info(wa_log(), "waContainerFix v46 constructor running");
-    wa_marker(@"=== waContainerFix v46 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v47 constructor running");
+    wa_marker(@"=== waContainerFix v47 constructor ===");
 
     // v43: register an image-load callback — fires the MOMENT UIKitCore (and
     // every other image) loads, which is BEFORE application:didFinishLaunching.
@@ -1764,6 +1772,31 @@ static void wa_init(void) {
         });
     }
 
+    // v47: force the root to REBUILD its view. Its first loadView ran while
+    // the app still believed storage was critical (degraded mode → 0 subviews).
+    // Storage reads are all NO now, so a second viewDidLoad may build the real
+    // UI. Run at +10s and +30s only (avoid fighting UIKit's own loading).
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        id app = [(id)NSClassFromString(@"UIApplication") performSelector:NSSelectorFromString(@"sharedApplication")];
+        id windows = [app respondsToSelector:NSSelectorFromString(@"windows")]
+                     ? [app performSelector:NSSelectorFromString(@"windows")] : nil;
+        for (id w in windows) {
+            id root = [w performSelector:NSSelectorFromString(@"rootViewController")];
+            if (!root) continue;
+            SEL vdl = NSSelectorFromString(@"viewDidLoad");
+            if ([root respondsToSelector:vdl]) {
+                ((void (*)(id, SEL))objc_msgSend)(root, vdl);
+                wa_marker([NSString stringWithFormat:@"BYPASS re-ran viewDidLoad on %@",
+                           NSStringFromClass(object_getClass(root))]);
+            }
+            id sub = [root performSelector:@selector(view)];
+            NSArray *subs = [sub respondsToSelector:NSSelectorFromString(@"subviews")]
+                            ? [sub performSelector:NSSelectorFromString(@"subviews")] : nil;
+            wa_marker([NSString stringWithFormat:@"BYPASS post-rebuild subviews: %lu",
+                       (unsigned long)[subs count]]);
+        }
+    });
     // v31: schedule the in-app UI driver (registration drive) — reads
     // Documents/wafix_drive.txt at +8s (DUMP/TYPE/TAP/STATS commands)
     wa_drive_schedule();
