@@ -54,6 +54,7 @@
 // forward decl (wa_marker defined later in file)
 static void wa_marker(NSString *line);
 static void wa_markerOnce(NSString *line);
+static void wa_swizzle_inst(Class cls, SEL sel, IMP imp, IMP *origOut);
 
 // ---------- v10: dyld interpose (anti-tamper evasion) ----------
 // v15: no real_* function pointers — the fakes call the imported symbols
@@ -652,6 +653,54 @@ static void wa_dismiss_storage_modal(void) {
     }
 }
 
+// ---------- v35: kill the low-storage screen at the SOURCE ----------
+// v34 proved the app RE-PRESENTS the storage modal after one-shot
+// dismissals (sticky _WACriticallyLowSpaceDidOccur flag + a third
+// presentation path we haven't hooked). Robust fix: swizzle
+// viewDidAppear: on both storage VCs so the screen dismisses itself
+// the instant it appears — no matter how many times it's re-presented —
+// plus a repeating dismissal timer as backup.
+
+static IMP wa_orig_storage_vc1_viewDidAppear = NULL;
+static IMP wa_orig_storage_vc2_viewDidAppear = NULL;
+
+static void wa_storage_vc_kill_on_appear(id self, SEL _cmd, BOOL animated) {
+    // call this class's original first (it's just [super viewDidAppear:])
+    IMP orig = wa_orig_storage_vc1_viewDidAppear;
+    if (orig) ((void (*)(id, SEL, BOOL))orig)(self, _cmd, animated);
+    wa_marker([NSString stringWithFormat:@"BYPASS killing %@ on appear",
+               NSStringFromClass(object_getClass(self))]);
+    // dismiss from the presenting parent (async — avoid recursion)
+    dispatch_async(dispatch_get_main_queue(), ^{
+        id parent = [self performSelector:@selector(presentingViewController)];
+        if (parent) {
+            [parent performSelector:@selector(dismissViewControllerAnimated:completion:)
+                         withObject:@NO withObject:nil];
+        }
+    });
+}
+
+static void wa_kill_storage_on_appear(void) {
+    Class c1 = NSClassFromString(@"WACriticallyLowStorageViewController");
+    Class c2 = NSClassFromString(@"WAStorageWarningViewController");
+    if (c1 && !wa_orig_storage_vc1_viewDidAppear) {
+        wa_swizzle_inst(c1, @selector(viewDidAppear:),
+                        (IMP)wa_storage_vc_kill_on_appear, &wa_orig_storage_vc1_viewDidAppear);
+        wa_marker([NSString stringWithFormat:@"BYPASS viewDidAppear swizzled on %@",
+                   class_getName(c1)]);
+    }
+    if (c2 && !wa_orig_storage_vc2_viewDidAppear) {
+        // second class: swap its own original in, same replacement IMP
+        Method m = class_getInstanceMethod(c2, @selector(viewDidAppear:));
+        if (m) {
+            wa_orig_storage_vc2_viewDidAppear = method_getImplementation(m);
+            method_setImplementation(m, (IMP)wa_storage_vc_kill_on_appear);
+            wa_marker([NSString stringWithFormat:@"BYPASS viewDidAppear swizzled on %@",
+                       class_getName(c2)]);
+        }
+    }
+}
+
 static void wa_drive_schedule(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
@@ -1180,8 +1229,8 @@ static void wa_init(void) {
     // v34: fresh marker per launch (old log storms could reach 68 MB and
     // freeze the main thread; we only need THIS launch's ground truth)
     wa_marker_reset();
-    os_log_info(wa_log(), "waContainerFix v34 constructor running");
-    wa_marker(@"=== waContainerFix v34 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v35 constructor running");
+    wa_marker(@"=== waContainerFix v35 constructor ===");
 
     // v32: low-storage gate bypass — run early and retry (classes may not be
     // loaded yet at constructor time), then dismiss any shown modal later
@@ -1190,12 +1239,22 @@ static void wa_init(void) {
                    dispatch_get_main_queue(), ^{
         wa_bypass_low_storage();
         wa_dismiss_storage_modal();
+        wa_kill_storage_on_appear();
     });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         wa_bypass_low_storage();
         wa_dismiss_storage_modal();
+        wa_kill_storage_on_appear();
     });
+    // v35: repeating storage-modal kill — the app re-presents the gate on a
+    // timer, so keep dismissing every 2 s for the first 2 minutes
+    for (int i = 0; i < 60; i++) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((2 + i * 2) * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            wa_dismiss_storage_modal();
+        });
+    }
 
     // v31: schedule the in-app UI driver (registration drive) — reads
     // Documents/wafix_drive.txt at +8s (DUMP/TYPE/TAP/STATS commands)
