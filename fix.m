@@ -478,6 +478,24 @@ static void wa_drive_run(void) {
         NSString *trimmed = [cmd stringByTrimmingCharactersInSet:
                              [NSCharacterSet whitespaceAndNewlineCharacterSet]];
         if ([trimmed hasPrefix:@"DUMP"]) {
+            // v40: log root class + presented chain per window (diagnosis)
+            for (id w in windows) {
+                id root = [w performSelector:NSSelectorFromString(@"rootViewController")];
+                if (root) {
+                    NSMutableString *chain = [NSMutableString stringWithString:
+                        NSStringFromClass(object_getClass(root))];
+                    id presented = [root performSelector:@selector(presentedViewController)];
+                    while (presented) {
+                        [chain appendFormat:@" -> %@", NSStringFromClass(object_getClass(presented))];
+                        id next = [presented performSelector:@selector(presentedViewController)];
+                        if (next == presented) break;
+                        presented = next;
+                    }
+                    wa_marker([NSString stringWithFormat:@"UI ROOTCHAIN %@", chain]);
+                } else {
+                    wa_marker(@"UI ROOTCHAIN (nil root)");
+                }
+            }
             for (id w in windows) wa_drive_log_view(w, 0);
         } else if ([trimmed hasPrefix:@"TYPE "]) {
             NSString *digits = [trimmed substringFromIndex:5];
@@ -771,11 +789,12 @@ static void wa_presentModalVC_block(id self, SEL _cmd, id vc, BOOL animated) {
     ((void (*)(id, SEL, id, BOOL))orig)(self, _cmd, vc, animated);
 }
 
-// v39: the storage VC is the WINDOW ROOT (set at launch, before our +2s
-// patches) — not a presented modal. Dismissals can never remove a root VC,
-// which is why v36-v38 loops could not kill it. Fix: give the window the
-// app's NORMAL root (WARootViewController) instead, whenever a storage VC
-// shows up as root.
+// v39/v40: the storage VC is presented ON the window root (set at launch,
+// before our +2s patches) and dismissals silently FAIL (marker: found in
+// presented chain every 2s, never leaves, ZERO re-presentation hits on any
+// patched selector — the modal is stuck, not re-presented). Fix: replace
+// the whole window root with the app's NORMAL root (WARootViewController)
+// whenever the presented chain holds a storage VC — wiping the stuck modal.
 static id wa_make_good_root(void) {
     Class rvc = NSClassFromString(@"WARootViewController");
     id vc = nil;
@@ -798,6 +817,7 @@ static void wa_swap_storage_root(void) {
     if (![wins isKindOfClass:[NSArray class]]) return;
     for (id w in (NSArray *)wins) {
         id root = [w performSelector:@selector(rootViewController)];
+        if (!root) continue;
         if (wa_is_storage_vc(root)) {
             id good = wa_make_good_root();
             if (good) {
@@ -805,8 +825,39 @@ static void wa_swap_storage_root(void) {
                 wa_marker([NSString stringWithFormat:@"BYPASS SWAPPED storage root -> %s",
                            class_getName(object_getClass(good))]);
             }
+            continue;
+        }
+        // v40: storage VC stuck in the presented chain — dismiss is failing,
+        // so nuke the whole root (wipes the stuck modal with it)
+        id presented = [root performSelector:@selector(presentedViewController)];
+        while (presented) {
+            if (wa_is_storage_vc(presented)) {
+                id good = wa_make_good_root();
+                if (good) {
+                    [w performSelector:@selector(setRootViewController:) withObject:good];
+                    wa_marker([NSString stringWithFormat:
+                               @"BYPASS NUKE root (%s) with stuck storage modal -> %s",
+                               class_getName(object_getClass(root)),
+                               class_getName(object_getClass(good))]);
+                }
+                break;
+            }
+            id next = [presented performSelector:@selector(presentedViewController)];
+            if (next == presented) break;
+            presented = next;
         }
     }
+}
+
+static void wa_presentPrivate_block(id self, SEL _cmd, id vc, id anim, id completion) {
+    if (wa_is_storage_vc(vc)) {
+        wa_marker([NSString stringWithFormat:@"BYPASS BLOCKED storage-modal private-present from %s",
+                   class_getName(object_getClass(self))]);
+        return;
+    }
+    IMP orig = wa_orig_pres_imp(object_getClass(self), _cmd);
+    if (!orig) orig = orig_presentVC;
+    ((void (*)(id, SEL, id, id, id))orig)(self, _cmd, vc, anim, completion);
 }
 
 static void wa_setRootVC_block(id self, SEL _cmd, id vc) {
@@ -843,16 +894,22 @@ static void wa_block_storage_presentation(void) {
         wa_marker(@"BYPASS setRootViewController: blocked for storage VCs");
     }
     // v38: patch EVERY WhatsApp class that implements these selectors — a
-    // subclass override bypasses the UIViewController-level swizzle
+    // subclass override bypasses the UIViewController-level swizzle.
+    // v40: also patch UIKit's private presentation funnel
+    // _presentViewController:withAnimationController:completion: — public
+    // presentViewController: funnels into it, and direct private calls
+    // bypass the public selector entirely.
     const char *selNames[] = {
         "presentViewController:animated:completion:",
         "presentModalViewController:animated:",
         "setRootViewController:",
+        "_presentViewController:withAnimationController:completion:",
     };
-    SEL sels[3] = {
+    SEL sels[4] = {
         sel_registerName(selNames[0]),
         sel_registerName(selNames[1]),
         sel_registerName(selNames[2]),
+        sel_registerName(selNames[3]),
     };
     int n = objc_getClassList(NULL, 0);
     if (n <= 0) return;
@@ -873,6 +930,7 @@ static void wa_block_storage_presentation(void) {
             if (name == sels[0]) newImp = (IMP)wa_presentVC_block;
             else if (name == sels[1]) newImp = (IMP)wa_presentModalVC_block;
             else if (name == sels[2]) newImp = (IMP)wa_setRootVC_block;
+            else if (name == sels[3]) newImp = (IMP)wa_presentPrivate_block;
             if (!newImp || cur == newImp) continue;
             // save per-class original (first time only)
             BOOL have = NO;
@@ -1451,8 +1509,8 @@ static void wa_init(void) {
     // v34: fresh marker per launch (old log storms could reach 68 MB and
     // freeze the main thread; we only need THIS launch's ground truth)
     wa_marker_reset();
-    os_log_info(wa_log(), "waContainerFix v39 constructor running");
-    wa_marker(@"=== waContainerFix v39 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v40 constructor running");
+    wa_marker(@"=== waContainerFix v40 constructor ===");
 
     // v32: low-storage gate bypass — run early and retry (classes may not be
     // loaded yet at constructor time), then dismiss any shown modal later
