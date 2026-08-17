@@ -1690,8 +1690,8 @@ static void wa_init(void) {
     // v34: fresh marker per launch (old log storms could reach 68 MB and
     // freeze the main thread; we only need THIS launch's ground truth)
     wa_marker_reset();
-    os_log_info(wa_log(), "waContainerFix v49 constructor running");
-    wa_marker(@"=== waContainerFix v49 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v49b constructor running");
+    wa_marker(@"=== waContainerFix v49b constructor ===");
 
     // v43: register an image-load callback — fires the MOMENT UIKitCore (and
     // every other image) loads, which is BEFORE application:didFinishLaunching.
@@ -1817,8 +1817,9 @@ static void wa_init(void) {
     });
     // v49: keep the screen awake while WhatsApp is foreground — the device
     // auto-locked mid-flow (16:58) and blocked all tooling. Idempotent.
-    id app = [UIApplication sharedApplication];
-    if (app) [app setIdleTimerDisabled:YES];
+    // Foundation-only: UIApplication via NSClassFromString, never direct.
+    id appObj = [(id)NSClassFromString(@"UIApplication") performSelector:NSSelectorFromString(@"sharedApplication")];
+    if (appObj) [appObj performSelector:NSSelectorFromString(@"setIdleTimerDisabled:") withObject:@YES];
     // v31: schedule the in-app UI driver (registration drive) — reads
     // Documents/wafix_drive.txt at +8s (DUMP/TYPE/TAP/STATS commands)
     wa_drive_schedule();
