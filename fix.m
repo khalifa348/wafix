@@ -1551,9 +1551,12 @@ static void wa_swizzle_scoped(Class cls, SEL sel, IMP imp, IMP *origOut) {
     }
 }
 
-// v43: image-load callback — fires once per image as dyld loads it.
-// When UIKitCore loads, UIViewController/UIWindow exist and we can
-// install the presentation block BEFORE the app's own launch code runs.
+// v43/v44: image-load callback — fires while dyld is loading images.
+// IMPORTANT (v44): do NOT touch the runtime here (objc_getClassList /
+// method_setImplementation deadlock with the runtime's load lock — that's
+// what hung v43). Set a flag only; the real blocking work is dispatched to
+// the main queue, which drains BEFORE application:didFinishLaunching.
+static volatile int wa_g_early_ready = 0;
 static void wa_on_image_load(const struct mach_header *mh) {
     (void)mh;
     uint32_t c = _dyld_image_count();
@@ -1561,8 +1564,7 @@ static void wa_on_image_load(const struct mach_header *mh) {
         const char *path = _dyld_get_image_name(i);
         if (!path) continue;
         if (strstr(path, "UIKitCore") || strstr(path, "/UIKit")) {
-            wa_marker(@"BYPASS UIKitCore loaded — early presentation block");
-            wa_block_storage_presentation();
+            wa_g_early_ready = 1;
             return;
         }
     }
@@ -1573,8 +1575,8 @@ static void wa_init(void) {
     // v34: fresh marker per launch (old log storms could reach 68 MB and
     // freeze the main thread; we only need THIS launch's ground truth)
     wa_marker_reset();
-    os_log_info(wa_log(), "waContainerFix v43 constructor running");
-    wa_marker(@"=== waContainerFix v43 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v44 constructor running");
+    wa_marker(@"=== waContainerFix v44 constructor ===");
 
     // v43: register an image-load callback — fires the MOMENT UIKitCore (and
     // every other image) loads, which is BEFORE application:didFinishLaunching.
@@ -1583,12 +1585,18 @@ static void wa_init(void) {
     // (wa_block_storage_presentation is idempotent; the +2s/+6s blocks below
     // remain as belt-and-braces for late-loaded WhatsApp classes.)
     objc_addLoadImageFunc(wa_on_image_load);
-    // If UIKit already loaded before us (load-command order), the callback
-    // won't fire for it — install the block right now instead.
-    if (NSClassFromString(@"UIViewController")) {
-        wa_marker(@"BYPASS UIKit already loaded at constructor — early block");
-        wa_block_storage_presentation();
-    }
+    // v44: +0s main-queue block — drains BEFORE application:didFinishLaunching
+    // (UIApplicationMain processes queued main-queue blocks first). If UIKit
+    // was already loaded (either order), the presentation block is live before
+    // the app can present the storage modal at launch.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (wa_g_early_ready || NSClassFromString(@"UIViewController")) {
+            wa_marker(@"BYPASS early block installed (pre-didFinishLaunching)");
+            wa_block_storage_presentation();
+            wa_bypass_low_storage();
+            wa_kill_storage_on_appear();
+        }
+    });
 
     // v32: low-storage gate bypass — run early and retry (classes may not be
     // loaded yet at constructor time), then dismiss any shown modal later
