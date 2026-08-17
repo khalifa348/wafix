@@ -1690,8 +1690,8 @@ static void wa_init(void) {
     // v34: fresh marker per launch (old log storms could reach 68 MB and
     // freeze the main thread; we only need THIS launch's ground truth)
     wa_marker_reset();
-    os_log_info(wa_log(), "waContainerFix v47 constructor running");
-    wa_marker(@"=== waContainerFix v47 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v48 constructor running");
+    wa_marker(@"=== waContainerFix v48 constructor ===");
 
     // v43: register an image-load callback — fires the MOMENT UIKitCore (and
     // every other image) loads, which is BEFORE application:didFinishLaunching.
@@ -1700,6 +1700,21 @@ static void wa_init(void) {
     // (wa_block_storage_presentation is idempotent; the +2s/+6s blocks below
     // remain as belt-and-braces for late-loaded WhatsApp classes.)
     objc_addLoadImageFunc(wa_on_image_load);
+    // v48: THE timing fix. UIApplicationMain calls didFinishLaunching
+    // SYNCHRONOUSLY before the main runloop drains — so any main-queue
+    // dispatch (even the +0s block) runs AFTER the app presented the storage
+    // gate and entered degraded mode. A BACKGROUND queue dispatch blocks on
+    // the runtime lock during dyld load, then runs the instant loading
+    // finishes — BEFORE main() and didFinishLaunching. Patches land before
+    // the startup decision is made.
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        wa_marker(@"BYPASS bg-early block running (pre-main)");
+        wa_block_storage_presentation();
+        wa_neutralize_storage_reads();
+        wa_bypass_low_storage();
+        wa_kill_storage_on_appear();
+        wa_marker(@"BYPASS bg-early block done");
+    });
     // v44: +0s main-queue block — drains BEFORE application:didFinishLaunching
     // (UIApplicationMain processes queued main-queue blocks first). If UIKit
     // was already loaded (either order), the presentation block is live before
