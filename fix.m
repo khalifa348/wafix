@@ -902,6 +902,75 @@ static void wa_setRootVC_block(id self, SEL _cmd, id vc) {
     ((void (*)(id, SEL, id))orig)(self, _cmd, vc);
 }
 
+// v45: make EVERY storage-state read return "storage is fine". WhatsApp's
+// startup skips building its real UI when it thinks storage is critical;
+// the VC-level block (v44) kills the screen but the UI still never builds.
+// Patch any instance/class method on WhatsApp classes whose selector name
+// contains critically-low-storage markers to a zero-returning stub.
+// Deliberately NOT matching bare "storage" (would nuke WAChatStorage DB
+// methods). Idempotent: re-entry sees the stub already installed.
+static id wa_stub_zero(id self, SEL _cmd) { (void)self; (void)_cmd; return 0; }
+
+static void wa_neutralize_storage_reads(void) {
+    const char *needles[] = { "criticallow", "lowspace", "lowstorage" };
+    int n = objc_getClassList(NULL, 0);
+    if (n <= 0) return;
+    Class *classes = (Class *)malloc(sizeof(Class) * n);
+    n = objc_getClassList(classes, n);
+    int neutered = 0;
+    for (int i = 0; i < n; i++) {
+        Class cls = classes[i];
+        if (class_isMetaClass(cls)) continue;
+        const char *img = class_getImageName(cls);
+        if (!img || !strstr(img, "WhatsApp.app/WhatsApp")) continue;
+        // instance methods
+        unsigned int mc = 0;
+        Method *methods = class_copyMethodList(cls, &mc);
+        for (unsigned int j = 0; j < mc; j++) {
+            SEL sel = method_getName(methods[j]);
+            const char *sn = sel_getName(sel);
+            if (!sn) continue;
+            char lower[256];
+            size_t k = 0;
+            for (; sn[k] && k < sizeof(lower) - 1; k++) lower[k] = (sn[k] >= 'A' && sn[k] <= 'Z') ? sn[k] + 32 : sn[k];
+            lower[k] = 0;
+            int hit = 0;
+            for (int m = 0; m < 3; m++) if (strstr(lower, needles[m])) { hit = 1; break; }
+            if (!hit) continue;
+            IMP cur = class_getMethodImplementation(cls, sel);
+            if (cur == (IMP)wa_stub_zero) continue;
+            method_setImplementation(methods[j], (IMP)wa_stub_zero);
+            if (neutered < 24) wa_marker(@"NEUTRAL inst %s %s", class_getName(cls), sn);
+            neutered++;
+        }
+        if (methods) free(methods);
+        // class methods
+        Class meta = object_getClass(cls);
+        unsigned int mcc = 0;
+        Method *cms = class_copyMethodList(meta, &mcc);
+        for (unsigned int j = 0; j < mcc; j++) {
+            SEL sel = method_getName(cms[j]);
+            const char *sn = sel_getName(sel);
+            if (!sn) continue;
+            char lower[256];
+            size_t k = 0;
+            for (; sn[k] && k < sizeof(lower) - 1; k++) lower[k] = (sn[k] >= 'A' && sn[k] <= 'Z') ? sn[k] + 32 : sn[k];
+            lower[k] = 0;
+            int hit = 0;
+            for (int m = 0; m < 3; m++) if (strstr(lower, needles[m])) { hit = 1; break; }
+            if (!hit) continue;
+            IMP cur = class_getMethodImplementation(meta, sel);
+            if (cur == (IMP)wa_stub_zero) continue;
+            method_setImplementation(cms[j], (IMP)wa_stub_zero);
+            if (neutered < 24) wa_marker(@"NEUTRAL cls %s %s", class_getName(cls), sn);
+            neutered++;
+        }
+        if (cms) free(cms);
+    }
+    free(classes);
+    wa_marker(@"NEUTRAL total %d storage reads zeroed", neutered);
+}
+
 static void wa_block_storage_presentation(void) {
     // v43: this can now fire from objc_addLoadImageFunc (UIKitCore load
     // moment, BEFORE application:didFinishLaunching) — all swizzles below
@@ -1575,8 +1644,8 @@ static void wa_init(void) {
     // v34: fresh marker per launch (old log storms could reach 68 MB and
     // freeze the main thread; we only need THIS launch's ground truth)
     wa_marker_reset();
-    os_log_info(wa_log(), "waContainerFix v44 constructor running");
-    wa_marker(@"=== waContainerFix v44 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v45 constructor running");
+    wa_marker(@"=== waContainerFix v45 constructor ===");
 
     // v43: register an image-load callback — fires the MOMENT UIKitCore (and
     // every other image) loads, which is BEFORE application:didFinishLaunching.
@@ -1595,6 +1664,7 @@ static void wa_init(void) {
             wa_block_storage_presentation();
             wa_bypass_low_storage();
             wa_kill_storage_on_appear();
+            wa_neutralize_storage_reads();
         }
     });
 
@@ -1608,6 +1678,7 @@ static void wa_init(void) {
         wa_kill_storage_on_appear();
         wa_block_storage_presentation();
         wa_swap_storage_root();
+        wa_neutralize_storage_reads();
     });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
@@ -1616,6 +1687,7 @@ static void wa_init(void) {
         wa_kill_storage_on_appear();
         wa_block_storage_presentation();
         wa_swap_storage_root();
+        wa_neutralize_storage_reads();
     });
     // v37/v39: repeating storage-modal kill — the app re-presents the gate on a
     // timer, so keep dismissing + root-swapping every 2 s for the first 2 minutes
