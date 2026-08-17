@@ -332,6 +332,12 @@ static BOOL wa_isOsLogSelector(const char *sel) {
 
 static id wa_noop(id self, SEL _cmd) { return nil; }
 
+// v26: +bundleForClass on WhatsApp classes returns the app bundle (pristine
+// behavior). The asset loader WARequires non-nil — nil aborts launch.
+static id wa_bundleForClass(id self, SEL _cmd) {
+    return [NSBundle mainBundle];
+}
+
 // v11: NEVER call class_getInstanceMethod / class_getMethodImplementation
 // inside the resolver — those trigger resolveMethod_locked -> our swizzle ->
 // infinite recursion (ME40 crash 03:18:59: 6+ alternating frames, stack
@@ -438,7 +444,13 @@ static BOOL wa_resolveClass(id self, SEL _cmd, SEL name) {
         return NO;
     }
     wa_resolvingCls = YES;
-    BOOL added = class_addMethod(meta, name, (IMP)wa_noop, "@@:");
+    // v26: +bundleForClass must return a REAL bundle, not nil. The asset
+    // loader (__WhatsAppAssetsImageLoaderClass) calls it during launch and
+    // WARequire's the result; pristine resolves it to the app bundle. nil
+    // → WAHandleFailureInFunction abort at XPluginsGetFuncPtr (crash 010857).
+    IMP imp = (strcmp(selName, "bundleForClass") == 0)
+                  ? (IMP)wa_bundleForClass : (IMP)wa_noop;
+    BOOL added = class_addMethod(meta, name, imp, "@@:");
     wa_resolvingCls = NO;
     if (!added && !wa_hasMethodDirect(meta, name)) {
         return NO;
@@ -752,8 +764,8 @@ static void wa_swizzle_inst(Class cls, SEL sel, IMP imp, IMP *origOut) {
 
 __attribute__((constructor))
 static void wa_init(void) {
-    os_log_info(wa_log(), "waContainerFix v25 constructor running");
-    wa_marker(@"=== waContainerFix v25 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v26 constructor running");
+    wa_marker(@"=== waContainerFix v26 constructor ===");
 
     // v10/v11: anti-tamper evasion — init dyld interpose reals FIRST so the
     // fakes are correct before any swizzle/launch activity
