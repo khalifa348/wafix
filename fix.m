@@ -705,6 +705,69 @@ static void wa_kill_storage_on_appear(void) {
     }
 }
 
+// ---------- v37: block the storage-screen PRESENTATION at the source ----------
+// v36 proved the app RE-PRESENTS the storage modal instantly after every
+// dismissal (marker shows a dismissal loop while the screen stays up). The
+// re-presenter is some path we haven't nopped yet. Instead of chasing it,
+// nullify the presentation call itself: any -presentViewController: whose
+// incoming VC is a storage VC (directly or nav-wrapped) is swallowed, and we
+// log WHO tried to present it so the marker names the source.
+static IMP orig_presentVC = NULL;
+static void wa_presentVC_block(id self, SEL _cmd, id vc, BOOL animated, id completion) {
+    BOOL bad = NO;
+    if (vc) {
+        id target = vc;
+        if ([target isKindOfClass:NSClassFromString(@"UINavigationController")]) {
+            id top = [target performSelector:@selector(topViewController)];
+            if (top) target = top;
+        }
+        Class c1 = NSClassFromString(@"WACriticallyLowStorageViewController");
+        Class c2 = NSClassFromString(@"WAStorageWarningViewController");
+        if ((c1 && [target isKindOfClass:c1]) || (c2 && [target isKindOfClass:c2])) {
+            bad = YES;
+        }
+    }
+    if (bad) {
+        wa_marker([NSString stringWithFormat:@"BYPASS BLOCKED storage-modal present from %s",
+                   class_getName(object_getClass(self))]);
+        if (completion) ((void (^)(void))completion)();
+        return;
+    }
+    ((void (*)(id, SEL, id, BOOL, id))orig_presentVC)(self, _cmd, vc, animated, completion);
+}
+
+static IMP orig_presentModalVC = NULL;
+static void wa_presentModalVC_block(id self, SEL _cmd, id vc, BOOL animated) {
+    BOOL bad = NO;
+    if (vc) {
+        Class c1 = NSClassFromString(@"WACriticallyLowStorageViewController");
+        Class c2 = NSClassFromString(@"WAStorageWarningViewController");
+        if ((c1 && [vc isKindOfClass:c1]) || (c2 && [vc isKindOfClass:c2])) {
+            bad = YES;
+        }
+    }
+    if (bad) {
+        wa_marker([NSString stringWithFormat:@"BYPASS BLOCKED storage-modal presentModal from %s",
+                   class_getName(object_getClass(self))]);
+        return;
+    }
+    ((void (*)(id, SEL, id, BOOL))orig_presentModalVC)(self, _cmd, vc, animated);
+}
+
+static void wa_block_storage_presentation(void) {
+    Class uivc = [UIViewController class];
+    if (!orig_presentVC) {
+        wa_swizzle_scoped(uivc, @selector(presentViewController:animated:completion:),
+                          (IMP)wa_presentVC_block, &orig_presentVC);
+        wa_marker(@"BYPASS presentViewController: blocked for storage VCs");
+    }
+    if (!orig_presentModalVC) {
+        wa_swizzle_scoped(uivc, @selector(presentModalViewController:animated:),
+                          (IMP)wa_presentModalVC_block, &orig_presentModalVC);
+        wa_marker(@"BYPASS presentModalViewController: blocked for storage VCs");
+    }
+}
+
 static void wa_drive_schedule(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
@@ -1255,8 +1318,8 @@ static void wa_init(void) {
     // v34: fresh marker per launch (old log storms could reach 68 MB and
     // freeze the main thread; we only need THIS launch's ground truth)
     wa_marker_reset();
-    os_log_info(wa_log(), "waContainerFix v36 constructor running");
-    wa_marker(@"=== waContainerFix v36 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v37 constructor running");
+    wa_marker(@"=== waContainerFix v37 constructor ===");
 
     // v32: low-storage gate bypass — run early and retry (classes may not be
     // loaded yet at constructor time), then dismiss any shown modal later
@@ -1266,14 +1329,16 @@ static void wa_init(void) {
         wa_bypass_low_storage();
         wa_dismiss_storage_modal();
         wa_kill_storage_on_appear();
+        wa_block_storage_presentation();
     });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         wa_bypass_low_storage();
         wa_dismiss_storage_modal();
         wa_kill_storage_on_appear();
+        wa_block_storage_presentation();
     });
-    // v36: repeating storage-modal kill — the app re-presents the gate on a
+    // v37: repeating storage-modal kill — the app re-presents the gate on a
     // timer, so keep dismissing every 2 s for the first 2 minutes
     for (int i = 0; i < 60; i++) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((2 + i * 2) * NSEC_PER_SEC)),
