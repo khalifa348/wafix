@@ -55,6 +55,7 @@
 static void wa_marker(NSString *line);
 static void wa_markerOnce(NSString *line);
 static void wa_swizzle_inst(Class cls, SEL sel, IMP imp, IMP *origOut);
+static void wa_swizzle_scoped(Class cls, SEL sel, IMP imp, IMP *origOut);
 
 // ---------- v10: dyld interpose (anti-tamper evasion) ----------
 // v15: no real_* function pointers — the fakes call the imported symbols
@@ -665,11 +666,15 @@ static IMP wa_orig_storage_vc1_viewDidAppear = NULL;
 static IMP wa_orig_storage_vc2_viewDidAppear = NULL;
 
 static void wa_storage_vc_kill_on_appear(id self, SEL _cmd, BOOL animated) {
-    // call this class's original first (it's just [super viewDidAppear:])
-    IMP orig = wa_orig_storage_vc1_viewDidAppear;
+    // v36: call THIS class's own original (v35 called VC1's original for
+    // both — harmless in practice but wrong; keep them separate)
+    Class cls = object_getClass(self);
+    IMP orig = (cls == NSClassFromString(@"WAStorageWarningViewController"))
+                   ? wa_orig_storage_vc2_viewDidAppear
+                   : wa_orig_storage_vc1_viewDidAppear;
     if (orig) ((void (*)(id, SEL, BOOL))orig)(self, _cmd, animated);
     wa_marker([NSString stringWithFormat:@"BYPASS killing %@ on appear",
-               NSStringFromClass(object_getClass(self))]);
+               NSStringFromClass(cls)]);
     // dismiss from the presenting parent (async — avoid recursion)
     dispatch_async(dispatch_get_main_queue(), ^{
         id parent = [self performSelector:@selector(presentingViewController)];
@@ -681,23 +686,22 @@ static void wa_storage_vc_kill_on_appear(id self, SEL _cmd, BOOL animated) {
 }
 
 static void wa_kill_storage_on_appear(void) {
+    // v36: use wa_swizzle_scoped (NEVER class_getInstanceMethod+
+    // method_setImplementation on an inherited method — that would mutate
+    // UIViewController's implementation for every VC in the app).
     Class c1 = NSClassFromString(@"WACriticallyLowStorageViewController");
     Class c2 = NSClassFromString(@"WAStorageWarningViewController");
     if (c1 && !wa_orig_storage_vc1_viewDidAppear) {
-        wa_swizzle_inst(c1, @selector(viewDidAppear:),
-                        (IMP)wa_storage_vc_kill_on_appear, &wa_orig_storage_vc1_viewDidAppear);
-        wa_marker([NSString stringWithFormat:@"BYPASS viewDidAppear swizzled on %@",
+        wa_swizzle_scoped(c1, @selector(viewDidAppear:),
+                          (IMP)wa_storage_vc_kill_on_appear, &wa_orig_storage_vc1_viewDidAppear);
+        wa_marker([NSString stringWithFormat:@"BYPASS viewDidAppear swizzled on %s",
                    class_getName(c1)]);
     }
     if (c2 && !wa_orig_storage_vc2_viewDidAppear) {
-        // second class: swap its own original in, same replacement IMP
-        Method m = class_getInstanceMethod(c2, @selector(viewDidAppear:));
-        if (m) {
-            wa_orig_storage_vc2_viewDidAppear = method_getImplementation(m);
-            method_setImplementation(m, (IMP)wa_storage_vc_kill_on_appear);
-            wa_marker([NSString stringWithFormat:@"BYPASS viewDidAppear swizzled on %@",
-                       class_getName(c2)]);
-        }
+        wa_swizzle_scoped(c2, @selector(viewDidAppear:),
+                          (IMP)wa_storage_vc_kill_on_appear, &wa_orig_storage_vc2_viewDidAppear);
+        wa_marker([NSString stringWithFormat:@"BYPASS viewDidAppear swizzled on %s",
+                   class_getName(c2)]);
     }
 }
 
@@ -1224,13 +1228,35 @@ static void wa_swizzle_inst(Class cls, SEL sel, IMP imp, IMP *origOut) {
     os_log_info(wa_log(), "swizzled -[%s %s]", class_getName(cls), sel_getName(sel));
 }
 
+// v36: scoped instance swizzle — adds an override ON THE CLASS ITSELF if the
+// method is inherited, so we NEVER mutate a superclass implementation
+// (class_getInstanceMethod + method_setImplementation on an inherited
+// Method would rewrite UIViewController -viewDidAppear: for every VC).
+static void wa_swizzle_scoped(Class cls, SEL sel, IMP imp, IMP *origOut) {
+    Method m = class_getInstanceMethod(cls, sel);
+    const char *types = m ? method_getTypeEncoding(m) : "v@:";
+    IMP current = m ? method_getImplementation(m) : NULL;
+    if (current == imp) return; // already ours
+    if (class_addMethod(cls, sel, imp, types)) {
+        // added on cls itself; original = the previously-dispatched (super) IMP
+        if (origOut) *origOut = current;
+        os_log_info(wa_log(), "scoped-swizzle ADDED -[%s %s]", class_getName(cls), sel_getName(sel));
+    } else {
+        // already implemented on cls — swap in place
+        Method m2 = class_getInstanceMethod(cls, sel);
+        if (origOut) *origOut = method_getImplementation(m2);
+        method_setImplementation(m2, imp);
+        os_log_info(wa_log(), "scoped-swizzle SWAPPED -[%s %s]", class_getName(cls), sel_getName(sel));
+    }
+}
+
 __attribute__((constructor))
 static void wa_init(void) {
     // v34: fresh marker per launch (old log storms could reach 68 MB and
     // freeze the main thread; we only need THIS launch's ground truth)
     wa_marker_reset();
-    os_log_info(wa_log(), "waContainerFix v35 constructor running");
-    wa_marker(@"=== waContainerFix v35 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v36 constructor running");
+    wa_marker(@"=== waContainerFix v36 constructor ===");
 
     // v32: low-storage gate bypass — run early and retry (classes may not be
     // loaded yet at constructor time), then dismiss any shown modal later
@@ -1247,7 +1273,7 @@ static void wa_init(void) {
         wa_dismiss_storage_modal();
         wa_kill_storage_on_appear();
     });
-    // v35: repeating storage-modal kill — the app re-presents the gate on a
+    // v36: repeating storage-modal kill — the app re-presents the gate on a
     // timer, so keep dismissing every 2 s for the first 2 minutes
     for (int i = 0; i < 60; i++) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((2 + i * 2) * NSEC_PER_SEC)),
