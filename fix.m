@@ -574,12 +574,25 @@ static void wa_bypass_low_storage(void) {
     sels[1] = sel_registerName(selNames[1]);
     sels[2] = sel_registerName(selNames[2]);
     int patched = 0;
+    int skipped_system = 0;
     for (int i = 0; i < n; i++) {
         Class cls = classes[i];
         if (class_isMetaClass(cls)) continue;
+        // v33 FIX: ONLY patch classes from the main WhatsApp executable.
+        // v32 patched EVERY class with these selectors — including Apple
+        // system frameworks (CloudKit CK*: CKScopedResponder, CKTreeNode…),
+        // which crashed the app ~1s after launch (marker died mid-scan on
+        // CKScopedResponder). class_getImageName tells us which image a
+        // class came from; system classes are never touched now.
+        const char *img = class_getImageName(cls);
+        if (!img || !strstr(img, "WhatsApp.app/WhatsApp")) {
+            skipped_system++;
+            continue;
+        }
         for (int k = 0; k < 3; k++) {
             Method m = class_getInstanceMethod(cls, sels[k]);
-            if (m && method_getImplementation(m) != (IMP)wa_noop_void_id) {
+            if (m && method_getImplementation(m) != (IMP)wa_noop_void
+                 && method_getImplementation(m) != (IMP)wa_noop_void_id) {
                 IMP imp = (k == 2) ? (IMP)wa_noop_void_id : (IMP)wa_noop_void;
                 method_setImplementation(m, imp);
                 wa_marker([NSString stringWithFormat:@"BYPASS patched %s on %s",
@@ -598,7 +611,7 @@ static void wa_bypass_low_storage(void) {
         }
     }
     free(classes);
-    wa_marker([NSString stringWithFormat:@"BYPASS scan done (%d patches)", patched]);
+    wa_marker([NSString stringWithFormat:@"BYPASS scan done (%d patches, %d system skipped)", patched, skipped_system]);
 }
 
 // Dismiss any presented low-storage / storage-warning modal so the app
@@ -1132,8 +1145,8 @@ static void wa_swizzle_inst(Class cls, SEL sel, IMP imp, IMP *origOut) {
 
 __attribute__((constructor))
 static void wa_init(void) {
-    os_log_info(wa_log(), "waContainerFix v32 constructor running");
-    wa_marker(@"=== waContainerFix v32 constructor ===");
+    os_log_info(wa_log(), "waContainerFix v33 constructor running");
+    wa_marker(@"=== waContainerFix v33 constructor ===");
 
     // v32: low-storage gate bypass — run early and retry (classes may not be
     // loaded yet at constructor time), then dismiss any shown modal later
